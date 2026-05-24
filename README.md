@@ -1,3 +1,4 @@
+这个项目是从YourQuantGuy的项目fork而来的，做了自动化
 # variational-v1
 
 邀请链接：
