@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Variational CDP Forwarder",
+  "version": "1.0.0",
+  "description": "Capture Variational REST responses and WebSocket frames via CDP and forward to local WebSocket ports.",
+  "permissions": ["debugger", "tabs", "storage", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_title": "Variational Forwarder",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:*"
+  }
+}
