@@ -9,7 +9,7 @@ import signal
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal
 from pathlib import Path
 from statistics import median
@@ -58,8 +58,10 @@ LIGHTER_WS_PING_INTERVAL_SECONDS = 30
 LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
 
 
+CST = timezone(timedelta(hours=8))
+
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(CST).isoformat()
 
 
 def to_decimal(value: Any) -> Decimal | None:
@@ -832,6 +834,63 @@ class VariationalToLighterRuntime:
                 await self.process_variational_trade_event(event)
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
+    async def load_initial_positions(self) -> None:
+        from lighter import ApiClient, Configuration, AccountApi
+
+        # ── Lighter side (REST API, authoritative) ──────────────────────────
+        lighter_long_notional = Decimal("0")
+        lighter_short_notional = Decimal("0")
+        try:
+            api_client = ApiClient(configuration=Configuration(host=self.lighter_base_url))
+            account_api = AccountApi(api_client)
+            account_data = await account_api.account(by="index", value=str(self.account_index))
+            await api_client.close()
+            if account_data and account_data.accounts:
+                acc = account_data.accounts[0]
+                for pos in (acc.positions or []):
+                    if pos.market_id != self.lighter_market_index:
+                        continue
+                    qty = Decimal(str(pos.position))
+                    if abs(qty) < Decimal("0.000001"):
+                        continue
+                    value = abs(Decimal(str(pos.position_value)))
+                    if qty < 0:
+                        lighter_long_notional = value
+                    else:
+                        lighter_short_notional = value
+        except Exception as exc:
+            self.logger.warning("Failed to query Lighter initial position: %s", exc)
+
+        # ── Variational side (monitor portfolio stream) ──────────────────────
+        var_pos = self.runtime.monitor.positions.get(self.variational_ticker)
+        if var_pos:
+            var_qty = to_decimal(var_pos.get("qty"))
+            var_value = to_decimal(var_pos.get("value"))
+            if var_qty is not None and var_value is not None and abs(var_qty) > Decimal("0.000001"):
+                var_notional = abs(var_value)
+                if var_qty > 0:
+                    if lighter_long_notional > 0:
+                        diff_pct = abs(var_notional - lighter_long_notional) / lighter_long_notional * 100
+                        if diff_pct > Decimal("5"):
+                            self.logger.warning(
+                                "Position mismatch: Variational LONG ~%s USDC vs Lighter SHORT ~%s USDC (%.1f%%)",
+                                var_notional, lighter_long_notional, diff_pct,
+                            )
+                    self.logger.info("Variational initial position: LONG %s BTC (~%s USDC)", var_qty, var_notional)
+                else:
+                    self.logger.info("Variational initial position: SHORT %s BTC (~%s USDC)", var_qty, var_notional)
+        else:
+            self.logger.info("Variational portfolio not yet streamed; using Lighter position as initial state")
+
+        # ── Apply to notional counters ────────────────────────────────────────
+        self._open_long_notional = lighter_long_notional
+        self._open_short_notional = lighter_short_notional
+        if lighter_long_notional > 0 or lighter_short_notional > 0:
+            self.logger.info(
+                "Initial open notional set: long=%s USDC short=%s USDC",
+                lighter_long_notional, lighter_short_notional,
+            )
+
     async def signal_loop(self) -> None:
         while not self.stop_flag:
             await asyncio.sleep(0.5)
@@ -1311,6 +1370,7 @@ class VariationalToLighterRuntime:
         self.initialize_lighter_client()
         initial_asset = await self.wait_for_ticker_resolution()
         await self.activate_asset(initial_asset, reason="startup")
+        await self.load_initial_positions()
 
         self.trade_event_cursor = await self.runtime.monitor.get_latest_trade_event_seq()
         self.logger.info("Tracking new Variational trade events from seq>%s", self.trade_event_cursor)
