@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Variational Forwarder</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: "Segoe UI", sans-serif;
+      }
+
+      body {
+        margin: 0;
+        width: 340px;
+        padding: 14px;
+        background: #f6f8fa;
+      }
+
+      h1 {
+        font-size: 16px;
+        margin: 0 0 10px;
+      }
+
+      .field {
+        margin-bottom: 10px;
+      }
+
+      label {
+        display: block;
+        font-size: 12px;
+        margin-bottom: 4px;
+        color: #1f2328;
+      }
+
+      input {
+        width: 100%;
+        box-sizing: border-box;
+        padding: 7px 8px;
+        border: 1px solid #d0d7de;
+        border-radius: 6px;
+        background: white;
+      }
+
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+        min-height: 70px;
+        padding: 7px 8px;
+        border: 1px solid #d0d7de;
+        border-radius: 6px;
+        background: white;
+        resize: vertical;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-size: 11px;
+      }
+
+      .row {
+        display: flex;
+        gap: 8px;
+        margin-top: 12px;
+      }
+
+      button {
+        flex: 1;
+        border: 1px solid #1f6feb;
+        border-radius: 6px;
+        background: #1f6feb;
+        color: white;
+        padding: 7px 8px;
+        cursor: pointer;
+      }
+
+      button.secondary {
+        background: white;
+        color: #1f6feb;
+      }
+
+      #status {
+        margin-top: 12px;
+        padding: 8px;
+        border-radius: 6px;
+        background: white;
+        border: 1px solid #d0d7de;
+        font-size: 12px;
+        line-height: 1.4;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Variational CDP Forwarder</h1>
+    <div class="field">
+      <label for="domainFilter">Domain filter contains</label>
+      <input id="domainFilter" placeholder="variational" />
+    </div>
+    <div class="field">
+      <label for="wsEndpoint">WebSocket frames endpoint</label>
+      <input id="wsEndpoint" placeholder="ws://127.0.0.1:8766" />
+    </div>
+    <div class="field">
+      <label for="restEndpoint">REST responses endpoint</label>
+      <input id="restEndpoint" placeholder="ws://127.0.0.1:8767" />
+    </div>
+    <div class="field">
+      <label for="commandEndpoint">Command broker endpoint</label>
+      <input id="commandEndpoint" placeholder="ws://127.0.0.1:8768" />
+    </div>
+    <div class="field">
+      <label for="restAllowlist">REST URL allowlist (one URL per line)</label>
+      <textarea id="restAllowlist"></textarea>
+    </div>
+    <div class="row">
+      <button id="saveConfig" class="secondary">Save</button>
+      <button id="start">Start</button>
+      <button id="stop" class="secondary">Stop</button>
+    </div>
+    <div id="status">Loading...</div>
+    <script src="popup.js"></script>
+  </body>
+</html>
