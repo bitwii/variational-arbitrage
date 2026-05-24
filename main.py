@@ -243,6 +243,10 @@ class VariationalToLighterRuntime:
         self.signal_threshold_pct = Decimal(os.getenv("VAR_SIGNAL_THRESHOLD_PCT", "0.01"))
         self.order_notional_usdc = Decimal(os.getenv("VAR_ORDER_NOTIONAL_USDC", "300"))
         self.order_cooldown_seconds = float(os.getenv("VAR_ORDER_COOLDOWN_SECONDS", "120"))
+        self.max_total_notional_usdc = Decimal(os.getenv("VAR_MAX_TOTAL_NOTIONAL_USDC", "1000"))
+        self.close_min_profit_pct = Decimal(os.getenv("VAR_CLOSE_MIN_PROFIT_PCT", "0.02"))
+        self._open_long_notional: Decimal = Decimal("0")
+        self._open_short_notional: Decimal = Decimal("0")
         self._last_variational_order_ts: float = 0.0
         self._order_in_flight: bool = False
         self.signal_task: asyncio.Task[None] | None = None
@@ -845,6 +849,21 @@ class VariationalToLighterRuntime:
             long_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
             short_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
 
+            # Close opportunities take priority
+            if self._open_long_notional > 0 and short_pct is not None and short_pct >= self.close_min_profit_pct:
+                qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
+                await self._trigger_variational_order("sell", qty, short_pct, is_close=True)
+                continue
+            if self._open_short_notional > 0 and long_pct is not None and long_pct >= self.close_min_profit_pct:
+                qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
+                await self._trigger_variational_order("buy", qty, long_pct, is_close=True)
+                continue
+
+            # Open new position if within notional limit
+            total_open = self._open_long_notional + self._open_short_notional
+            if total_open + self.order_notional_usdc > self.max_total_notional_usdc:
+                continue
+
             if long_pct is not None and long_pct >= self.signal_threshold_pct:
                 qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
                 await self._trigger_variational_order("buy", qty, long_pct)
@@ -852,28 +871,41 @@ class VariationalToLighterRuntime:
                 qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
                 await self._trigger_variational_order("sell", qty, short_pct)
 
-    async def _trigger_variational_order(self, side: str, qty: Decimal, trigger_pct: Decimal) -> None:
+    async def _trigger_variational_order(
+        self, side: str, qty: Decimal, trigger_pct: Decimal, is_close: bool = False
+    ) -> None:
         if self._order_in_flight:
             return
         self._order_in_flight = True
         qty_str = format(qty, "f")
+        action = "CLOSE" if is_close else "OPEN"
         try:
             self.logger.info(
-                "Signal triggered: side=%s qty=%s trigger_pct=%s%%",
-                side, qty_str, trigger_pct,
+                "Signal triggered (%s): side=%s qty=%s trigger_pct=%s%%",
+                action, side, qty_str, trigger_pct,
             )
             result = await self.runtime.broker.place_order_internal(
                 side=side,
                 amount=qty_str,
                 max_slippage=0.01,
-                is_reduce_only=False,
+                is_reduce_only=is_close,
             )
             self._last_variational_order_ts = time.monotonic()
             if result.get("ok"):
+                if is_close:
+                    if side == "sell":
+                        self._open_long_notional = max(Decimal("0"), self._open_long_notional - self.order_notional_usdc)
+                    else:
+                        self._open_short_notional = max(Decimal("0"), self._open_short_notional - self.order_notional_usdc)
+                else:
+                    if side == "buy":
+                        self._open_long_notional += self.order_notional_usdc
+                    else:
+                        self._open_short_notional += self.order_notional_usdc
                 rfq_id = (result.get("data") or {}).get("rfq_id", "-")
-                self.logger.info("Variational order ok: side=%s qty=%s rfq_id=%s", side, qty_str, rfq_id)
+                self.logger.info("Variational order ok (%s): side=%s qty=%s rfq_id=%s", action, side, qty_str, rfq_id)
             else:
-                self.logger.warning("Variational order failed: side=%s qty=%s error=%s", side, qty_str, result.get("error"))
+                self.logger.warning("Variational order failed (%s): side=%s qty=%s error=%s", action, side, qty_str, result.get("error"))
         except Exception as exc:
             self.logger.error("Variational order error: %s", exc)
         finally:
@@ -1048,17 +1080,21 @@ class VariationalToLighterRuntime:
 
         now_mono = time.monotonic()
         cooldown_remaining = self.order_cooldown_seconds - (now_mono - self._last_variational_order_ts)
+        total_open = self._open_long_notional + self._open_short_notional
         if self._order_in_flight:
             signal_text = "[yellow]IN FLIGHT[/yellow]"
         elif cooldown_remaining > 0:
             signal_text = f"[yellow]COOLDOWN {int(cooldown_remaining)}s[/yellow]"
+        elif total_open >= self.max_total_notional_usdc:
+            signal_text = f"[cyan]CLOSE ONLY ≥{self.close_min_profit_pct}%[/cyan]"
         else:
             signal_text = f"[green]MONITORING ≥{self.signal_threshold_pct}%[/green]"
 
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
-            f"signal={signal_text} | {utc_now()}",
+            f"signal={signal_text} | "
+            f"L={self._open_long_notional}U S={self._open_short_notional}U / max={self.max_total_notional_usdc}U | {utc_now()}",
             border_style="cyan",
         )
 
