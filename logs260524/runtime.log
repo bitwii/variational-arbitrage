@@ -1,8 +1,0 @@
-2026-05-24 14:25:50,652 | INFO | Listening for Variational forwarder events on ws://127.0.0.1:8766 and ws://127.0.0.1:8767
-2026-05-24 14:26:23,285 | INFO | Variational heartbeat is live
-2026-05-24 14:26:26,666 | INFO | Switched market (startup): variational_asset=BTC -> lighter_ticker=BTC market_id=1
-2026-05-24 14:26:26,669 | INFO | Tracking new Variational trade events from seq>0
-2026-05-24 14:29:31,024 | INFO | Signal triggered: side=buy qty=0.003932 trigger_pct=0.1210642012449247522692002345%
-2026-05-24 14:29:31,290 | INFO | Variational order ok: side=buy qty=0.003932 rfq_id=5b25cedd-83f5-4eca-b0cc-3940a65984f7
-2026-05-24 14:31:56,942 | INFO | Signal triggered: side=buy qty=0.003927 trigger_pct=0.08204261503898202235307853525%
-2026-05-24 14:31:57,244 | INFO | Variational order ok: side=buy qty=0.003927 rfq_id=1d8589a0-cd98-46b6-bd7b-af0107f7499b
