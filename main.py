@@ -61,7 +61,7 @@ LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
 CST = timezone(timedelta(hours=8))
 
 def utc_now() -> str:
-    return datetime.now(CST).isoformat()
+    return datetime.now(CST).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-5]
 
 
 def to_decimal(value: Any) -> Decimal | None:
@@ -253,6 +253,9 @@ class VariationalToLighterRuntime:
         self._last_variational_order_ts: float = 0.0
         self._order_in_flight: bool = False
         self.signal_task: asyncio.Task[None] | None = None
+        self.bbo_task: asyncio.Task[None] | None = None
+        self._bbo_log_interval = int(os.getenv("VAR_BBO_LOG_INTERVAL_SECONDS", "600"))
+        self._bbo_output_dir = output_dir
 
         self.orders_file = output_dir / "order_metrics.jsonl" if output_dir else None
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
@@ -835,6 +838,65 @@ class VariationalToLighterRuntime:
                 await self.process_variational_trade_event(event)
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
+    async def bbo_loop(self) -> None:
+        import csv as _csv
+        written_headers: set[str] = set()
+
+        while not self.stop_flag:
+            await asyncio.sleep(self._bbo_log_interval)
+            if self.stop_flag:
+                break
+
+            var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
+            lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
+            if None in (var_bid, var_ask, lighter_bid, lighter_ask):
+                continue
+
+            lighter_int_pct = (lighter_ask - lighter_bid) / lighter_bid * 100
+            open_thr = lighter_int_pct * self.spread_multiplier
+            close_thr = lighter_int_pct * self.close_multiplier
+            long_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
+            short_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
+
+            all_pos = self.runtime.monitor.positions
+            total_notional = sum(
+                abs(to_decimal(p.get("value")) or Decimal("0"))
+                for p in all_pos.values()
+            )
+
+            ticker = self.variational_ticker or "UNKNOWN"
+            out_dir = self._bbo_output_dir or Path("./logs")
+            out_dir.mkdir(parents=True, exist_ok=True)
+            bbo_file = out_dir / f"bbo_{ticker}.csv"
+
+            row = {
+                "timestamp": utc_now(),
+                "ticker": ticker,
+                "var_bid": format(var_bid, "f"),
+                "var_ask": format(var_ask, "f"),
+                "var_spread_pct": format((var_ask - var_bid) / var_bid * 100, "f"),
+                "lighter_bid": format(lighter_bid, "f"),
+                "lighter_ask": format(lighter_ask, "f"),
+                "lighter_spread_pct": format(lighter_int_pct, "f"),
+                "long_spread_pct": format(long_pct, "f") if long_pct is not None else "",
+                "short_spread_pct": format(short_pct, "f") if short_pct is not None else "",
+                "open_threshold_pct": format(open_thr, "f"),
+                "close_threshold_pct": format(close_thr, "f"),
+                "total_notional_usdc": format(total_notional, "f"),
+            }
+            headers = list(row.keys())
+            needs_header = str(bbo_file) not in written_headers and not bbo_file.exists()
+
+            def _write(path: Path, needs_hdr: bool, r: dict, hdrs: list) -> None:
+                with path.open("a", newline="", encoding="utf-8") as f:
+                    w = _csv.DictWriter(f, fieldnames=hdrs)
+                    if needs_hdr:
+                        w.writeheader()
+                    w.writerow(r)
+
+            await asyncio.to_thread(_write, bbo_file, needs_header, row, headers)
+            written_headers.add(str(bbo_file))
+
     async def load_initial_positions(self) -> None:
         from lighter import ApiClient, Configuration, AccountApi
 
@@ -993,10 +1055,21 @@ class VariationalToLighterRuntime:
         finally:
             self._order_in_flight = False
 
+    @staticmethod
+    def _fmt_ts(iso: str | None) -> str:
+        if not iso:
+            return "-"
+        try:
+            dt = datetime.fromisoformat(iso).astimezone(CST)
+            ms = dt.strftime("%f")[:2]
+            return dt.strftime(f"%y%m%d,%H:%M:%S.{ms}")
+        except Exception:
+            return "-"
+
     def _fmt_price(self, value: Decimal | None) -> str:
         if value is None:
             return "-"
-        return format(value, "f")
+        return f"{value:.2f}"
 
     @staticmethod
     def _direction_labels(side: str) -> tuple[str, str]:
@@ -1128,7 +1201,7 @@ class VariationalToLighterRuntime:
 
         is_zh = self.args.lang == "zh"
         header_title = "Variational <-> Lighter"
-        auto_hedge_label = "自动对冲" if is_zh else "auto_hedge"
+        auto_hedge_label = "对冲" if is_zh else "hedge"
         auto_hedge_on = "开" if is_zh else "ON"
         auto_hedge_off = "关" if is_zh else "OFF"
         quote_title = "最优买一 / 卖一" if is_zh else "Best Bid / Ask"
@@ -1152,6 +1225,7 @@ class VariationalToLighterRuntime:
         col_qty = "数量" if is_zh else "Qty"
         col_var_fill_px = "Var 成交价" if is_zh else "Var Fill Px"
         col_lighter_fill_px = "Lighter 成交价" if is_zh else "Lighter Fill Px"
+        col_fill_ts = "成交时间" if is_zh else "Fill Time"
         col_fill_diff = "成交价差(按方向)" if is_zh else "Fill Diff (Directional)"
         col_fill_diff_pct = "成交价差%(按方向)" if is_zh else "Fill Diff % (Directional)"
         no_orders_text = "（暂无订单）" if is_zh else "(no tracked orders yet)"
@@ -1167,14 +1241,45 @@ class VariationalToLighterRuntime:
             abs(to_decimal(p.get("value")) or Decimal("0"))
             for p in all_positions.values()
         )
-        if self._order_in_flight:
-            signal_text = "[yellow]IN FLIGHT[/yellow]"
-        elif cooldown_remaining > 0:
-            signal_text = f"[yellow]COOLDOWN {int(cooldown_remaining)}s[/yellow]"
-        elif total_notional >= self.max_total_notional_usdc:
-            signal_text = f"[cyan]CLOSE ONLY (×{self.close_multiplier})[/cyan]"
+
+        # Dynamic thresholds from Lighter internal spread
+        def _fmt_spread(val: Decimal | None) -> str:
+            if val is None:
+                return "-"
+            color = "green" if val > 0 else "red"
+            return f"[{color}]{val:.4f}%[/{color}]"
+
+        if lighter_bid and lighter_ask and lighter_bid > 0 and var_ask and var_bid:
+            lighter_int_pct = (lighter_ask - lighter_bid) / lighter_bid * 100
+            open_thr = lighter_int_pct * self.spread_multiplier
+            close_thr = lighter_int_pct * self.close_multiplier
+            open_thr_abs = open_thr * var_ask / 100
+            close_thr_abs = close_thr * var_ask / 100
+            long_abs = lighter_bid - var_ask
+            short_abs = var_bid - lighter_ask
+
+            def _fmt_abs(val: Decimal) -> str:
+                color = "green" if val > 0 else "red"
+                return f"[{color}]{val:+.2f}[/{color}]"
+
+            threshold_text = (
+                f"开仓阈值≥[bold]{open_thr:.4f}%[/bold]({open_thr_abs:.2f}U)  "
+                f"平仓阈值≥[bold]{close_thr:.4f}%[/bold]({close_thr_abs:.2f}U)  │  "
+                f"当前价差 多{_fmt_spread(long_var_short_lighter_pct)}({_fmt_abs(long_abs)}) "
+                f"空{_fmt_spread(short_var_long_lighter_pct)}({_fmt_abs(short_abs)})"
+            )
         else:
-            signal_text = f"[green]MONITORING ×{self.spread_multiplier} Lighter spread[/green]"
+            threshold_text = f"阈值倍数 开仓×{self.spread_multiplier} 平仓×{self.close_multiplier}"
+
+        # Signal state
+        if self._order_in_flight:
+            state_text = "[yellow]下单中 IN FLIGHT[/yellow]"
+        elif cooldown_remaining > 0:
+            state_text = f"[yellow]冷却中 COOLDOWN {int(cooldown_remaining)}s[/yellow]"
+        elif total_notional >= self.max_total_notional_usdc:
+            state_text = "[cyan]满仓 CLOSE ONLY[/cyan]"
+        else:
+            state_text = "[green]监控中 MONITORING[/green]"
 
         # Current asset position
         cur_pos = all_positions.get(self.variational_ticker, {})
@@ -1185,10 +1290,9 @@ class VariationalToLighterRuntime:
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
-            f"signal={signal_text}\n"
-            f"总仓位={total_notional:.0f}/{self.max_total_notional_usdc}U  "
-            f"当前({self.ticker})={cur_pos_text}  "
-            f"程序追踪 L={self._open_long_notional:.0f}U S={self._open_short_notional:.0f}U | {utc_now()}",
+            f"状态={state_text} | {utc_now()}\n"
+            f"信号: {threshold_text}\n"
+            f"持仓: 总={total_notional:.0f}/{self.max_total_notional_usdc}U  当前({self.ticker})={cur_pos_text}",
             border_style="cyan",
         )
 
@@ -1250,6 +1354,7 @@ class VariationalToLighterRuntime:
         )
 
         orders_table = Table(title=orders_title, show_header=True, expand=True)
+        orders_table.add_column(col_fill_ts)
         orders_table.add_column(col_trade_id)
         orders_table.add_column(col_side)
         orders_table.add_column(col_qty, justify="right")
@@ -1261,6 +1366,7 @@ class VariationalToLighterRuntime:
         if not rows:
             orders_table.add_row(
                 no_orders_text,
+                "-",
                 "-",
                 "-",
                 "-",
@@ -1280,11 +1386,12 @@ class VariationalToLighterRuntime:
                 side_zh, side_en = self._direction_labels(row.side)
                 side_display = side_zh if is_zh else side_en
                 orders_table.add_row(
+                    self._fmt_ts(row.var_fill_ts_iso),
                     trade_display,
                     side_display,
                     self._fmt_price(row.qty),
-                    payload["variational_filled_price"] or "-",
-                    payload["lighter_filled_price"] or "-",
+                    self._fmt_price(row.var_fill_price),
+                    self._fmt_price(row.lighter_fill_price),
                     self._fmt_price(fill_diff),
                     self._fmt_pct(fill_diff_pct),
                 )
@@ -1412,6 +1519,7 @@ class VariationalToLighterRuntime:
 
         self.trade_task = asyncio.create_task(self.trade_loop())
         self.signal_task = asyncio.create_task(self.signal_loop())
+        self.bbo_task = asyncio.create_task(self.bbo_loop())
         self.dashboard_task = asyncio.create_task(self.dashboard_loop())
 
         while not self.stop_flag:
@@ -1427,6 +1535,10 @@ class VariationalToLighterRuntime:
         if self.signal_task and not self.signal_task.done():
             self.signal_task.cancel()
             await asyncio.gather(self.signal_task, return_exceptions=True)
+
+        if self.bbo_task and not self.bbo_task.done():
+            self.bbo_task.cancel()
+            await asyncio.gather(self.bbo_task, return_exceptions=True)
 
         if self.trade_task and not self.trade_task.done():
             self.trade_task.cancel()
