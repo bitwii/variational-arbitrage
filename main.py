@@ -242,11 +242,12 @@ class VariationalToLighterRuntime:
             quiet=True,
         )
 
-        self.signal_threshold_pct = Decimal(os.getenv("VAR_SIGNAL_THRESHOLD_PCT", "0.01"))
+        self.spread_multiplier = Decimal(os.getenv("VAR_SPREAD_MULTIPLIER", "2.0"))
+        self.close_multiplier = Decimal(os.getenv("VAR_CLOSE_MULTIPLIER", "1.0"))
+        self.max_price_deviation_pct = Decimal(os.getenv("VAR_MAX_PRICE_DEVIATION_PCT", "10"))
         self.order_notional_usdc = Decimal(os.getenv("VAR_ORDER_NOTIONAL_USDC", "300"))
         self.order_cooldown_seconds = float(os.getenv("VAR_ORDER_COOLDOWN_SECONDS", "120"))
         self.max_total_notional_usdc = Decimal(os.getenv("VAR_MAX_TOTAL_NOTIONAL_USDC", "1000"))
-        self.close_min_profit_pct = Decimal(os.getenv("VAR_CLOSE_MIN_PROFIT_PCT", "0.02"))
         self._open_long_notional: Decimal = Decimal("0")
         self._open_short_notional: Decimal = Decimal("0")
         self._last_variational_order_ts: float = 0.0
@@ -905,28 +906,50 @@ class VariationalToLighterRuntime:
             if None in (var_bid, var_ask, lighter_bid, lighter_ask):
                 continue
 
+            # Price sanity check: skip if two exchanges diverge >VAR_MAX_PRICE_DEVIATION_PCT
+            var_mid = (var_bid + var_ask) / 2
+            lighter_mid = (lighter_bid + lighter_ask) / 2
+            price_deviation_pct = abs(var_mid - lighter_mid) / lighter_mid * 100
+            if price_deviation_pct > self.max_price_deviation_pct:
+                continue
+
+            # Dynamic threshold based on Lighter internal spread
+            lighter_internal_pct = (lighter_ask - lighter_bid) / lighter_bid * 100
+            open_threshold = lighter_internal_pct * self.spread_multiplier
+            close_threshold = lighter_internal_pct * self.close_multiplier
+
             long_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
             short_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
 
+            # Actual positions from exchange (source of truth)
+            all_pos = self.runtime.monitor.positions
+            actual_total = sum(
+                abs(to_decimal(p.get("value")) or Decimal("0"))
+                for p in all_pos.values()
+            )
+            cur_pos = all_pos.get(self.variational_ticker, {})
+            cur_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
+            has_long = cur_qty > Decimal("0.000001")
+            has_short = cur_qty < Decimal("-0.000001")
+
             # Close opportunities take priority
-            if self._open_long_notional > 0 and short_pct is not None and short_pct >= self.close_min_profit_pct:
+            if has_long and short_pct is not None and short_pct >= close_threshold:
                 qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
                 await self._trigger_variational_order("sell", qty, short_pct, is_close=True)
                 continue
-            if self._open_short_notional > 0 and long_pct is not None and long_pct >= self.close_min_profit_pct:
+            if has_short and long_pct is not None and long_pct >= close_threshold:
                 qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
                 await self._trigger_variational_order("buy", qty, long_pct, is_close=True)
                 continue
 
-            # Open new position if within notional limit
-            total_open = self._open_long_notional + self._open_short_notional
-            if total_open + self.order_notional_usdc > self.max_total_notional_usdc:
+            # Open new position only if total notional is within limit
+            if actual_total + self.order_notional_usdc > self.max_total_notional_usdc:
                 continue
 
-            if long_pct is not None and long_pct >= self.signal_threshold_pct:
+            if long_pct is not None and long_pct >= open_threshold:
                 qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
                 await self._trigger_variational_order("buy", qty, long_pct)
-            elif short_pct is not None and short_pct >= self.signal_threshold_pct:
+            elif short_pct is not None and short_pct >= open_threshold:
                 qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
                 await self._trigger_variational_order("sell", qty, short_pct)
 
@@ -1139,21 +1162,33 @@ class VariationalToLighterRuntime:
 
         now_mono = time.monotonic()
         cooldown_remaining = self.order_cooldown_seconds - (now_mono - self._last_variational_order_ts)
-        total_open = self._open_long_notional + self._open_short_notional
+        all_positions = self.runtime.monitor.positions
+        total_notional = sum(
+            abs(to_decimal(p.get("value")) or Decimal("0"))
+            for p in all_positions.values()
+        )
         if self._order_in_flight:
             signal_text = "[yellow]IN FLIGHT[/yellow]"
         elif cooldown_remaining > 0:
             signal_text = f"[yellow]COOLDOWN {int(cooldown_remaining)}s[/yellow]"
-        elif total_open >= self.max_total_notional_usdc:
-            signal_text = f"[cyan]CLOSE ONLY ≥{self.close_min_profit_pct}%[/cyan]"
+        elif total_notional >= self.max_total_notional_usdc:
+            signal_text = f"[cyan]CLOSE ONLY (×{self.close_multiplier})[/cyan]"
         else:
-            signal_text = f"[green]MONITORING ≥{self.signal_threshold_pct}%[/green]"
+            signal_text = f"[green]MONITORING ×{self.spread_multiplier} Lighter spread[/green]"
+
+        # Current asset position
+        cur_pos = all_positions.get(self.variational_ticker, {})
+        cur_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
+        cur_val = abs(to_decimal(cur_pos.get("value")) or Decimal("0"))
+        cur_pos_text = f"{cur_qty:+.4f} (~{cur_val:.0f}U)" if cur_qty != 0 else "flat"
 
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
-            f"signal={signal_text} | "
-            f"L={self._open_long_notional}U S={self._open_short_notional}U / max={self.max_total_notional_usdc}U | {utc_now()}",
+            f"signal={signal_text}\n"
+            f"总仓位={total_notional:.0f}/{self.max_total_notional_usdc}U  "
+            f"当前({self.ticker})={cur_pos_text}  "
+            f"程序追踪 L={self._open_long_notional:.0f}U S={self._open_short_notional:.0f}U | {utc_now()}",
             border_style="cyan",
         )
 
