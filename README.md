@@ -88,6 +88,24 @@ python main.py --lang en
 
 说明：终端仅用于显示 dashboard。程序不会落盘原始 REST/WS 消息，只会写运行日志、订单指标日志和交易记录 CSV 快照。
 
+
+先启动 Python bot，再点扩展的 Start。
+
+原因：
+
+python3.11 main.py 启动时会在本地开启三个 WebSocket 服务（端口 8766/8767/8768）
+扩展点 Start 之后会尝试连接这三个端口——如果 bot 还没起来，连接会失败
+扩展虽然有自动重试（每秒重连），但顺序对了更干净，也不容易漏掉状态。
+
+完整顺序：
+
+
+1. python3.11 main.py          ← 先跑，等看到日志输出正常
+2. Chrome 扩展 → 点 Start      ← 页面会自动 reload
+3. 等 Variational 页面加载完   ← 这时 instrument 缓存会被首次填充
+4. 之后每 30 秒自动保活        ← 新加的逻辑
+
+
 ---
 
 ## English

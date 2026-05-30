@@ -156,6 +156,11 @@ class OrderLifecycle:
     lighter_tx_hash: str | None = None
     hedge_error: str | None = None
 
+    matched_open_key: str | None = None   # FIFO matched open trade (for close legs)
+    var_pnl: Decimal | None = None        # Variational内部盈亏：(var_close - var_open) × qty
+    lt_pnl: Decimal | None = None         # Lighter内部盈亏：(lt_open - lt_close) × qty
+    roundtrip_pnl: Decimal | None = None  # 总盈亏 = var_pnl + lt_pnl
+
     def to_payload(self) -> dict[str, Any]:
         return {
             "trade_key": self.trade_key,
@@ -267,6 +272,7 @@ class VariationalToLighterRuntime:
         self.records: dict[str, OrderLifecycle] = {}
         self.record_order: deque[str] = deque(maxlen=500)
         self.lighter_client_order_to_trade_key: dict[int, str] = {}
+        self._open_trade_queue: deque[str] = deque()  # FIFO queue of unmatched open keys
         self._record_lock = asyncio.Lock()
         self.cross_spread_history: deque[tuple[float, float | None, float | None]] = deque()
         self._asset_switch_lock = asyncio.Lock()
@@ -505,6 +511,20 @@ class VariationalToLighterRuntime:
 
             record.lighter_fill_ts_iso = now_iso
             record.lighter_fill_price = fill_price
+
+            # Compute round-trip P&L once both legs of a close trade are filled
+            # P&L is computed per-exchange (funds don't cross exchanges):
+            #   Var P&L  = (var_close - var_open) × qty   ← long position on Variational
+            #   Lite P&L = (lt_open  - lt_close)  × qty   ← short position on Lighter
+            if record.side == "sell" and record.matched_open_key:
+                open_rec = self.records.get(record.matched_open_key)
+                if (open_rec and open_rec.var_fill_price and open_rec.lighter_fill_price
+                        and record.var_fill_price and fill_price):
+                    qty = min(open_rec.qty, record.qty)
+                    record.var_pnl = (record.var_fill_price - open_rec.var_fill_price) * qty
+                    record.lt_pnl  = (open_rec.lighter_fill_price - fill_price) * qty
+                    record.roundtrip_pnl = record.var_pnl + record.lt_pnl
+
             payload = record.to_payload()
 
         await self.append_order_log("lighter_fill", payload)
@@ -644,7 +664,7 @@ class VariationalToLighterRuntime:
     def trade_key(event: dict[str, Any]) -> str:
         trade_id = str(event.get("trade_id", "")).strip()
         if trade_id:
-            return f"id:{trade_id}"
+            return trade_id[:8]
         event_seq = str(event.get("event_seq", "")).strip()
         return f"seq:{event_seq}"
 
@@ -801,6 +821,22 @@ class VariationalToLighterRuntime:
             if should_set_fill:
                 record.var_fill_ts_iso = fill_iso
                 record.var_fill_price = to_decimal(event.get("price"))
+                # FIFO open/close matching for round-trip P&L
+                if side == "buy":
+                    self._open_trade_queue.append(key)
+                elif side == "sell" and self._open_trade_queue:
+                    open_key = self._open_trade_queue.popleft()
+                    open_rec = self.records.get(open_key)
+                    if open_rec and open_rec.var_fill_price and record.var_fill_price:
+                        # open leg: lighter_fill - var_fill (positive = captured spread)
+                        # close leg: var_fill - lighter_fill (negative if Lighter still higher)
+                        # round-trip per BTC = open_diff + close_diff
+                        open_diff = (open_rec.lighter_fill_price - open_rec.var_fill_price
+                                     if open_rec.lighter_fill_price else Decimal("0"))
+                        close_var_price = record.var_fill_price
+                        # Lighter close price not yet set; will update when lighter fill arrives
+                        record.matched_open_key = open_key
+                        open_rec.matched_open_key = key  # back-reference
                 filled_payload = record.to_payload()
             else:
                 filled_payload = None
@@ -868,7 +904,7 @@ class VariationalToLighterRuntime:
             ticker = self.variational_ticker or "UNKNOWN"
             out_dir = self._bbo_output_dir or Path("./logs")
             out_dir.mkdir(parents=True, exist_ok=True)
-            bbo_file = out_dir / f"bbo_{ticker}.csv"
+            bbo_file = out_dir / f"bbo_{ticker}_{datetime.now().strftime('%Y%m')}.csv"
 
             row = {
                 "timestamp": utc_now(),
@@ -1245,6 +1281,7 @@ class VariationalToLighterRuntime:
         col_fill_ts = "成交时间" if is_zh else "Fill Time"
         col_fill_diff = "价差(U)" if is_zh else "Spread(U)"
         col_fill_diff_pct = "价差%" if is_zh else "Spread%"
+        col_roundtrip_pnl = "回合盈亏U" if is_zh else "P&L(U)"
         no_orders_text = "（暂无订单）" if is_zh else "(no tracked orders yet)"
         variational_label = "Variational"
         lighter_label = "Lighter"
@@ -1390,17 +1427,12 @@ class VariationalToLighterRuntime:
         orders_table.add_column(col_lighter_fill_px, justify="right")
         orders_table.add_column(col_fill_diff, justify="right")
         orders_table.add_column(col_fill_diff_pct, justify="right")
+        orders_table.add_column(col_roundtrip_pnl, justify="right")
 
         if not rows:
             orders_table.add_row(
                 no_orders_text,
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
-                "-",
+                "-", "-", "-", "-", "-", "-", "-", "-",
             )
         else:
             for row in rows:
@@ -1413,6 +1445,11 @@ class VariationalToLighterRuntime:
                 )
                 side_zh, side_en = self._direction_labels(row.side)
                 side_display = side_zh if is_zh else side_en
+                if row.roundtrip_pnl is not None:
+                    pnl_color = "green" if row.roundtrip_pnl >= 0 else "red"
+                    pnl_str = f"[{pnl_color}]{row.roundtrip_pnl:+.4f}[/{pnl_color}]"
+                else:
+                    pnl_str = "-"
                 orders_table.add_row(
                     self._fmt_ts(row.var_fill_ts_iso),
                     trade_display,
@@ -1422,6 +1459,7 @@ class VariationalToLighterRuntime:
                     self._fmt_price(row.lighter_fill_price),
                     self._fmt_price(fill_diff),
                     self._fmt_pct(fill_diff_pct),
+                    pnl_str,
                 )
 
         return Group(header, quote_table, spread_table, orders_table)
@@ -1447,7 +1485,7 @@ class VariationalToLighterRuntime:
                 rows.append(
                     {
                         "trade_key": record.trade_key,
-                        "trade_id": record.trade_id,
+                        "trade_id": record.trade_id[:8] if record.trade_id else "",
                         "asset": record.asset,
                         "side_raw": record.side,
                         "direction_zh": side_zh,
@@ -1461,6 +1499,9 @@ class VariationalToLighterRuntime:
                         "lighter_filled_at": payload["lighter_filled_at"],
                         "fill_diff_var_minus_lighter": decimal_to_str(fill_diff),
                         "fill_diff_pct_vs_var": decimal_to_str(fill_diff_pct),
+                        "var_pnl_usd": decimal_to_str(record.var_pnl) if record.var_pnl is not None else "",
+                        "lt_pnl_usd": decimal_to_str(record.lt_pnl) if record.lt_pnl is not None else "",
+                        "roundtrip_pnl_usd": decimal_to_str(record.roundtrip_pnl) if record.roundtrip_pnl is not None else "",
                         "auto_hedge_enabled": payload["auto_hedge_enabled"],
                         "hedge_error": payload["hedge_error"],
                         "last_variational_status": payload["last_variational_status"],
@@ -1487,6 +1528,9 @@ class VariationalToLighterRuntime:
             "lighter_filled_at",
             "fill_diff_var_minus_lighter",
             "fill_diff_pct_vs_var",
+            "var_pnl_usd",
+            "lt_pnl_usd",
+            "roundtrip_pnl_usd",
             "auto_hedge_enabled",
             "hedge_error",
             "last_variational_status",
