@@ -55,6 +55,24 @@ const PAGE_INJECTION_SCRIPT = `
     return JSON.stringify(_lastQuote);
   };
 
+  // Keep instrument cache alive — poll every 30s so orders never fail with
+  // "No instrument cached yet" after a page reload clears _lastQuote.
+  setInterval(function () {
+    if (!_lastQuote || !_lastQuote.instrument) return;
+    _fetch('https://omni.variational.io/api/quotes/indicative', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ instrument: _lastQuote.instrument, qty: '0.001' })
+    }).then(function (res) {
+      if (res.ok) {
+        res.clone().json().then(function (data) {
+          if (data && data.instrument) _lastQuote = data;
+        }).catch(function () {});
+      }
+    }).catch(function () {});
+  }, 30000);
+
   // Two-step atomic order placement:
   //   1. POST /api/quotes/indicative with instrument + qty → fresh quote_id
   //   2. POST /api/quotes/accept with that quote_id

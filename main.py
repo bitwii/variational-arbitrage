@@ -76,7 +76,7 @@ def to_decimal(value: Any) -> Decimal | None:
 def decimal_to_str(value: Decimal | None) -> str | None:
     if value is None:
         return None
-    return format(value, "f")
+    return f"{value:,.6f}"
 
 
 def resolve_variational_ticker(ticker: str) -> str:
@@ -244,6 +244,7 @@ class VariationalToLighterRuntime:
 
         self.spread_multiplier = Decimal(os.getenv("VAR_SPREAD_MULTIPLIER", "2.0"))
         self.close_multiplier = Decimal(os.getenv("VAR_CLOSE_MULTIPLIER", "1.0"))
+        self.narrow_close_pct = Decimal(os.getenv("VAR_NARROW_CLOSE_PCT", "0.05"))
         self.max_price_deviation_pct = Decimal(os.getenv("VAR_MAX_PRICE_DEVIATION_PCT", "10"))
         self.order_notional_usdc = Decimal(os.getenv("VAR_ORDER_NOTIONAL_USDC", "300"))
         self.order_cooldown_seconds = float(os.getenv("VAR_ORDER_COOLDOWN_SECONDS", "120"))
@@ -872,17 +873,17 @@ class VariationalToLighterRuntime:
             row = {
                 "timestamp": utc_now(),
                 "ticker": ticker,
-                "var_bid": format(var_bid, "f"),
-                "var_ask": format(var_ask, "f"),
-                "var_spread_pct": format((var_ask - var_bid) / var_bid * 100, "f"),
-                "lighter_bid": format(lighter_bid, "f"),
-                "lighter_ask": format(lighter_ask, "f"),
-                "lighter_spread_pct": format(lighter_int_pct, "f"),
-                "long_spread_pct": format(long_pct, "f") if long_pct is not None else "",
-                "short_spread_pct": format(short_pct, "f") if short_pct is not None else "",
-                "open_threshold_pct": format(open_thr, "f"),
-                "close_threshold_pct": format(close_thr, "f"),
-                "total_notional_usdc": format(total_notional, "f"),
+                "var_bid": f"{var_bid:,.6f}",
+                "var_ask": f"{var_ask:,.6f}",
+                "var_spread_pct": f"{(var_ask - var_bid) / var_bid * 100:.6f}",
+                "lighter_bid": f"{lighter_bid:,.6f}",
+                "lighter_ask": f"{lighter_ask:,.6f}",
+                "lighter_spread_pct": f"{lighter_int_pct:.6f}",
+                "long_spread_pct": f"{long_pct:.6f}" if long_pct is not None else "",
+                "short_spread_pct": f"{short_pct:.6f}" if short_pct is not None else "",
+                "open_threshold_pct": f"{open_thr:.6f}",
+                "close_threshold_pct": f"{close_thr:.6f}",
+                "total_notional_usdc": f"{total_notional:,.6f}",
             }
             headers = list(row.keys())
             needs_header = str(bbo_file) not in written_headers and not bbo_file.exists()
@@ -1004,6 +1005,17 @@ class VariationalToLighterRuntime:
                 await self._trigger_variational_order("buy", qty, long_pct, is_close=True)
                 continue
 
+            # Narrow-spread close: premium has shrunk enough to lock in profit
+            # even without a full reversal (long_spread < VAR_NARROW_CLOSE_PCT)
+            if has_long and long_pct is not None and long_pct < self.narrow_close_pct:
+                qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
+                await self._trigger_variational_order("sell", qty, long_pct, is_close=True)
+                continue
+            if has_short and short_pct is not None and short_pct > -self.narrow_close_pct:
+                qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
+                await self._trigger_variational_order("buy", qty, short_pct, is_close=True)
+                continue
+
             # Open new position only if total notional is within limit
             if actual_total + self.order_notional_usdc > self.max_total_notional_usdc:
                 continue
@@ -1069,15 +1081,20 @@ class VariationalToLighterRuntime:
     def _fmt_price(self, value: Decimal | None) -> str:
         if value is None:
             return "-"
-        return f"{value:.2f}"
+        return f"{value:,.2f}"
+
+    def _fmt_qty(self, value: Decimal | None) -> str:
+        if value is None:
+            return "-"
+        return f"{value:.6f}".rstrip("0").rstrip(".")
 
     @staticmethod
     def _direction_labels(side: str) -> tuple[str, str]:
         side_n = side.strip().lower()
         if side_n == "buy":
-            return "做多 Var / 做空 Lighter", "Long Var / Short Lighter"
+            return "L Var / S Lighter", "L Var / S Lighter"
         if side_n == "sell":
-            return "做空 Var / 做多 Lighter", "Short Var / Long Lighter"
+            return "S Var / L Lighter", "S Var / L Lighter"
         side_u = side_n.upper() if side_n else "-"
         return side_u, side_u
 
@@ -1217,8 +1234,8 @@ class VariationalToLighterRuntime:
         col_median_5m_pct = "5分钟中位数%" if is_zh else "Median 5m %"
         col_median_30m_pct = "30分钟中位数%" if is_zh else "Median 30m %"
         col_median_1h_pct = "1小时中位数%" if is_zh else "Median 1h %"
-        metric_long_short = "做多 Var / 做空 Lighter" if is_zh else "Long Var / Short Lighter"
-        metric_short_long = "做空 Var / 做多 Lighter" if is_zh else "Short Var / Long Lighter"
+        metric_long_short = "L Var / S Lighter"
+        metric_short_long = "S Var / L Lighter"
         orders_title = "最近订单（最新在前）" if is_zh else "Recent Orders (latest first)"
         col_trade_id = "订单ID" if is_zh else "Trade ID"
         col_side = "方向" if is_zh else "Side"
@@ -1226,8 +1243,8 @@ class VariationalToLighterRuntime:
         col_var_fill_px = "Var 成交价" if is_zh else "Var Fill Px"
         col_lighter_fill_px = "Lighter 成交价" if is_zh else "Lighter Fill Px"
         col_fill_ts = "成交时间" if is_zh else "Fill Time"
-        col_fill_diff = "成交价差(按方向)" if is_zh else "Fill Diff (Directional)"
-        col_fill_diff_pct = "成交价差%(按方向)" if is_zh else "Fill Diff % (Directional)"
+        col_fill_diff = "价差(U)" if is_zh else "Spread(U)"
+        col_fill_diff_pct = "价差%" if is_zh else "Spread%"
         no_orders_text = "（暂无订单）" if is_zh else "(no tracked orders yet)"
         variational_label = "Variational"
         lighter_label = "Lighter"
@@ -1264,7 +1281,8 @@ class VariationalToLighterRuntime:
 
             threshold_text = (
                 f"开仓阈值≥[bold]{open_thr:.4f}%[/bold]({open_thr_abs:.2f}U)  "
-                f"平仓阈值≥[bold]{close_thr:.4f}%[/bold]({close_thr_abs:.2f}U)  │  "
+                f"平仓阈值≥[bold]{close_thr:.4f}%[/bold]({close_thr_abs:.2f}U)  "
+                f"收窄平仓<[bold]{self.narrow_close_pct:.2f}%[/bold]  │  "
                 f"当前价差 多{_fmt_spread(long_var_short_lighter_pct)}({_fmt_abs(long_abs)}) "
                 f"空{_fmt_spread(short_var_long_lighter_pct)}({_fmt_abs(short_abs)})"
             )
@@ -1285,7 +1303,17 @@ class VariationalToLighterRuntime:
         cur_pos = all_positions.get(self.variational_ticker, {})
         cur_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
         cur_val = abs(to_decimal(cur_pos.get("value")) or Decimal("0"))
-        cur_pos_text = f"{cur_qty:+.4f} (~{cur_val:.0f}U)" if cur_qty != 0 else "flat"
+        cur_upnl = to_decimal(cur_pos.get("upnl"))
+        if cur_qty == 0:
+            cur_pos_text = "flat"
+        else:
+            direction = "多" if cur_qty > 0 else "空"
+            upnl_str = ""
+            if cur_upnl is not None:
+                upnl_color = "green" if cur_upnl >= 0 else "red"
+                upnl_pct = cur_upnl / cur_val * 100 if cur_val > 0 else Decimal("0")
+                upnl_str = f"  UPnL=[{upnl_color}]{cur_upnl:+.2f}U({upnl_pct:+.3f}%)[/{upnl_color}]"
+            cur_pos_text = f"{direction}{cur_val:.0f}U{upnl_str}"
 
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
@@ -1389,7 +1417,7 @@ class VariationalToLighterRuntime:
                     self._fmt_ts(row.var_fill_ts_iso),
                     trade_display,
                     side_display,
-                    self._fmt_price(row.qty),
+                    self._fmt_qty(row.qty),
                     self._fmt_price(row.var_fill_price),
                     self._fmt_price(row.lighter_fill_price),
                     self._fmt_price(fill_diff),

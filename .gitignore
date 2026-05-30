@@ -28,6 +28,7 @@ htmlcov/
 # Local runtime artifacts
 logs/
 log/
+notes/
 .env
 
 # all excel files
