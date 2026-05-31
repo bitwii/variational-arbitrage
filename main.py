@@ -249,9 +249,10 @@ class VariationalToLighterRuntime:
 
         self.spread_multiplier = Decimal(os.getenv("VAR_SPREAD_MULTIPLIER", "2.0"))
         self.close_multiplier = Decimal(os.getenv("VAR_CLOSE_MULTIPLIER", "1.0"))
+        self.min_open_spread_pct = Decimal(os.getenv("VAR_MIN_OPEN_SPREAD_PCT", "0.09"))
         self.narrow_close_pct = Decimal(os.getenv("VAR_NARROW_CLOSE_PCT", "0.01"))
-        # Close when spread narrows to this fraction of the opening spread (e.g. 0.15 = 15%)
-        self.narrow_close_ratio = Decimal(os.getenv("VAR_NARROW_CLOSE_RATIO", "0.15"))
+        # Break-even delta = var_internal_spread + lt_internal_spread (measured median ≈ 0.0132%).
+        self.narrow_close_delta = Decimal(os.getenv("VAR_NARROW_CLOSE_DELTA_PCT", "0.0132"))
         self.max_price_deviation_pct = Decimal(os.getenv("VAR_MAX_PRICE_DEVIATION_PCT", "10"))
         self.order_notional_usdc = Decimal(os.getenv("VAR_ORDER_NOTIONAL_USDC", "300"))
         self.order_cooldown_seconds = float(os.getenv("VAR_ORDER_COOLDOWN_SECONDS", "120"))
@@ -911,17 +912,17 @@ class VariationalToLighterRuntime:
             row = {
                 "timestamp": utc_now(),
                 "ticker": ticker,
-                "var_bid": f"{var_bid:,.6f}",
-                "var_ask": f"{var_ask:,.6f}",
+                "var_bid": f"{var_bid:,.2f}",
+                "var_ask": f"{var_ask:,.2f}",
                 "var_spread_pct": f"{(var_ask - var_bid) / var_bid * 100:.6f}",
-                "lighter_bid": f"{lighter_bid:,.6f}",
-                "lighter_ask": f"{lighter_ask:,.6f}",
+                "lighter_bid": f"{lighter_bid:,.2f}",
+                "lighter_ask": f"{lighter_ask:,.2f}",
                 "lighter_spread_pct": f"{lighter_int_pct:.6f}",
                 "long_spread_pct": f"{long_pct:.6f}" if long_pct is not None else "",
                 "short_spread_pct": f"{short_pct:.6f}" if short_pct is not None else "",
                 "open_threshold_pct": f"{open_thr:.6f}",
                 "close_threshold_pct": f"{close_thr:.6f}",
-                "total_notional_usdc": f"{total_notional:,.6f}",
+                "total_notional_usdc": f"{total_notional:,.2f}",
             }
             headers = list(row.keys())
             needs_header = str(bbo_file) not in written_headers and not bbo_file.exists()
@@ -1047,8 +1048,12 @@ class VariationalToLighterRuntime:
             # Triggers when spread drops to VAR_NARROW_CLOSE_RATIO of the opening spread
             # (e.g. 0.15 = close when spread is ≤15% of what it was when we opened).
             # Falls back to the absolute VAR_NARROW_CLOSE_PCT floor if no open record found.
+            # Narrow-spread close: profitable when spread has narrowed by at least DELTA
+            # from the opening spread, covering both exchanges' execution costs.
+            # Profit condition: long_spread_close < open_spread - (var_spread + lt_spread)
+            # We use VAR_NARROW_CLOSE_DELTA_PCT as the required reduction (≈ execution costs).
             if has_long and long_pct is not None:
-                narrow_threshold = self.narrow_close_pct  # absolute floor fallback
+                narrow_threshold = -self.narrow_close_pct  # fallback: any near-zero spread
                 if self._open_trade_queue:
                     oldest_rec = self.records.get(self._open_trade_queue[0])
                     if (oldest_rec and oldest_rec.var_fill_price
@@ -1057,13 +1062,13 @@ class VariationalToLighterRuntime:
                             (oldest_rec.lighter_fill_price - oldest_rec.var_fill_price)
                             / oldest_rec.var_fill_price * 100
                         )
-                        narrow_threshold = open_spread_pct * self.narrow_close_ratio
+                        narrow_threshold = open_spread_pct - self.narrow_close_delta
                 if long_pct < narrow_threshold:
                     qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
                     await self._trigger_variational_order("sell", qty, long_pct, is_close=True)
                     continue
             if has_short and short_pct is not None:
-                narrow_threshold = -self.narrow_close_pct
+                narrow_threshold = self.narrow_close_pct  # fallback
                 if self._open_trade_queue:
                     oldest_rec = self.records.get(self._open_trade_queue[0])
                     if (oldest_rec and oldest_rec.var_fill_price
@@ -1072,7 +1077,7 @@ class VariationalToLighterRuntime:
                             (oldest_rec.var_fill_price - oldest_rec.lighter_fill_price)
                             / oldest_rec.lighter_fill_price * 100
                         )
-                        narrow_threshold = -(open_spread_pct * self.narrow_close_ratio)
+                        narrow_threshold = -(open_spread_pct - self.narrow_close_delta)
                 if short_pct > narrow_threshold:
                     qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
                     await self._trigger_variational_order("buy", qty, short_pct, is_close=True)
@@ -1082,10 +1087,12 @@ class VariationalToLighterRuntime:
             if actual_total + self.order_notional_usdc > self.max_total_notional_usdc:
                 continue
 
-            if long_pct is not None and long_pct >= open_threshold:
+            if (long_pct is not None and long_pct >= open_threshold
+                    and long_pct >= self.min_open_spread_pct):
                 qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
                 await self._trigger_variational_order("buy", qty, long_pct)
-            elif short_pct is not None and short_pct >= open_threshold:
+            elif (short_pct is not None and short_pct >= open_threshold
+                    and short_pct >= self.min_open_spread_pct):
                 qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
                 await self._trigger_variational_order("sell", qty, short_pct)
 
