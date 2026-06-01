@@ -161,6 +161,10 @@ class OrderLifecycle:
     lt_pnl: Decimal | None = None         # Lighter内部盈亏：(lt_open - lt_close) × qty
     roundtrip_pnl: Decimal | None = None  # 总盈亏 = var_pnl + lt_pnl
 
+    # Latency tracking
+    signal_trigger_ts: str | None = None    # T0: signal fired
+    lighter_order_ts: str | None = None     # T2: Lighter order sent
+
     def to_payload(self) -> dict[str, Any]:
         return {
             "trade_key": self.trade_key,
@@ -276,6 +280,7 @@ class VariationalToLighterRuntime:
         self.record_order: deque[str] = deque(maxlen=500)
         self.lighter_client_order_to_trade_key: dict[int, str] = {}
         self._open_trade_queue: deque[str] = deque()  # FIFO queue of unmatched open keys
+        self._pending_signal_ts: str | None = None    # T0 passed from signal_loop to trade handler
         self._record_lock = asyncio.Lock()
         self.cross_spread_history: deque[tuple[float, float | None, float | None]] = deque()
         self._asset_switch_lock = asyncio.Lock()
@@ -515,6 +520,25 @@ class VariationalToLighterRuntime:
             record.lighter_fill_ts_iso = now_iso
             record.lighter_fill_price = fill_price
 
+            # Latency logging
+            def _ms(a: str | None, b: str | None) -> str:
+                if not a or not b:
+                    return "?"
+                try:
+                    from dateutil import parser as _p
+                    dt = (_p.parse(b) - _p.parse(a)).total_seconds() * 1000
+                    return f"{dt:.0f}ms"
+                except Exception:
+                    return "?"
+
+            t0, t1, t2, t3 = (record.signal_trigger_ts, record.var_fill_ts_iso,
+                               record.lighter_order_ts, now_iso)
+            self.logger.info(
+                "⏱ Latency [%s] signal→varFill=%s  varFill→liteOrder=%s  liteOrder→liteFill=%s  total=%s",
+                record.trade_key,
+                _ms(t0, t1), _ms(t1, t2), _ms(t2, t3), _ms(t0, t3),
+            )
+
             # Compute round-trip P&L once both legs of a close trade are filled
             # P&L is computed per-exchange (funds don't cross exchanges):
             #   Var P&L  = (var_close - var_open) × qty   ← long position on Variational
@@ -748,6 +772,7 @@ class VariationalToLighterRuntime:
                 record.lighter_side = side
                 record.lighter_client_order_id = client_order_id
                 record.lighter_tx_hash = tx_hash
+                record.lighter_order_ts = utc_now()   # T2: Lighter order sent
                 record.hedge_error = None
                 self.lighter_client_order_to_trade_key[client_order_id] = record.trade_key
         except Exception as exc:
@@ -824,6 +849,7 @@ class VariationalToLighterRuntime:
             if should_set_fill:
                 record.var_fill_ts_iso = fill_iso
                 record.var_fill_price = to_decimal(event.get("price"))
+                record.signal_trigger_ts = self._pending_signal_ts  # T0 → record
                 # FIFO open/close matching for round-trip P&L
                 if side == "buy":
                     self._open_trade_queue.append(key)
@@ -1044,9 +1070,9 @@ class VariationalToLighterRuntime:
                 await self._trigger_variational_order("buy", qty, long_pct, is_close=True)
                 continue
 
-            # Narrow-spread close: relative to the opening spread of the oldest open position.
-            # Triggers when spread drops to VAR_NARROW_CLOSE_RATIO of the opening spread
-            # (e.g. 0.15 = close when spread is ≤15% of what it was when we opened).
+            # Narrow-spread close: profitable when spread has narrowed by at least DELTA
+            # from the opening spread, covering both exchanges' execution costs.
+            # Profit condition: long_spread_close < open_spread - (var_spread + lt_spread)
             # Falls back to the absolute VAR_NARROW_CLOSE_PCT floor if no open record found.
             # Narrow-spread close: profitable when spread has narrowed by at least DELTA
             # from the opening spread, covering both exchanges' execution costs.
@@ -1102,6 +1128,7 @@ class VariationalToLighterRuntime:
         if self._order_in_flight:
             return
         self._order_in_flight = True
+        self._pending_signal_ts = utc_now()   # T0: signal fired
         qty_str = format(qty, "f")
         action = "CLOSE" if is_close else "OPEN"
         try:
@@ -1535,6 +1562,8 @@ class VariationalToLighterRuntime:
                         "var_pnl_usd": decimal_to_str(record.var_pnl) if record.var_pnl is not None else "",
                         "lt_pnl_usd": decimal_to_str(record.lt_pnl) if record.lt_pnl is not None else "",
                         "roundtrip_pnl_usd": decimal_to_str(record.roundtrip_pnl) if record.roundtrip_pnl is not None else "",
+                        "signal_trigger_ts": record.signal_trigger_ts or "",
+                        "lighter_order_ts":  record.lighter_order_ts or "",
                         "auto_hedge_enabled": payload["auto_hedge_enabled"],
                         "hedge_error": payload["hedge_error"],
                         "last_variational_status": payload["last_variational_status"],
@@ -1564,6 +1593,8 @@ class VariationalToLighterRuntime:
             "var_pnl_usd",
             "lt_pnl_usd",
             "roundtrip_pnl_usd",
+            "signal_trigger_ts",
+            "lighter_order_ts",
             "auto_hedge_enabled",
             "hedge_error",
             "last_variational_status",
