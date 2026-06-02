@@ -281,6 +281,16 @@ class VariationalToLighterRuntime:
         self.lighter_client_order_to_trade_key: dict[int, str] = {}
         self._open_trade_queue: deque[str] = deque()  # FIFO queue of unmatched open keys
         self._pending_signal_ts: str | None = None    # T0 passed from signal_loop to trade handler
+
+        # Close-first: Lighter IOC limit order submitted before Var close
+        self._lite_close_order_id: int | None = None       # pending IOC order
+        self._lite_close_var_side: str | None = None       # "sell" or "buy"
+        self._lite_close_qty: Decimal | None = None
+        self._lite_close_trigger_pct: Decimal | None = None
+        self._lite_close_signal_ts: str | None = None
+
+        # Simultaneous submission: Lighter order sent at same time as Var
+        self._pre_submitted_lite_order_id: int | None = None
         self._record_lock = asyncio.Lock()
         self.cross_spread_history: deque[tuple[float, float | None, float | None]] = deque()
         self._asset_switch_lock = asyncio.Lock()
@@ -506,6 +516,21 @@ class VariationalToLighterRuntime:
             fill_price = filled_quote / filled_base
 
         now_iso = utc_now()
+
+        # IOC close-first: Lighter filled before Var — now trigger Var close
+        if client_order_id == self._lite_close_order_id and fill_price is not None:
+            self.logger.info(
+                "Lite IOC close filled @ %.2f — triggering Var close (side=%s qty=%s)",
+                float(fill_price), self._lite_close_var_side, self._lite_close_qty,
+            )
+            var_side = self._lite_close_var_side
+            qty      = self._lite_close_qty
+            tpct     = self._lite_close_trigger_pct
+            self._lite_close_order_id = None  # clear pending state
+            asyncio.create_task(
+                self._trigger_variational_order(var_side, qty, tpct, is_close=True)
+            )
+            return
 
         async with self._record_lock:
             trade_key = self.lighter_client_order_to_trade_key.get(client_order_id)
@@ -782,6 +807,112 @@ class VariationalToLighterRuntime:
                 payload = record.to_payload()
             await self.append_order_log("lighter_error", payload)
 
+    async def _submit_lite_close_ioc(
+        self, var_side: str, qty: Decimal, trigger_pct: Decimal
+    ) -> bool:
+        """Submit an IOC limit order on Lighter to close the position BEFORE touching Var.
+        Returns True if the order was submitted successfully (fill result comes via WS callback)."""
+        lite_bid, lite_ask = await self.get_lighter_best_bid_ask()
+        if lite_bid is None or lite_ask is None:
+            self.logger.warning("Lite IOC close: order book not ready")
+            return False
+
+        # For closing L-Var/S-Lite (var_side="sell"): buy back Lighter at current ask
+        # For closing S-Var/L-Lite (var_side="buy"):  sell Lighter at current bid
+        if var_side == "sell":
+            is_ask = False           # BUY order on Lighter
+            limit_price = lite_ask   # strict limit: won't pay above current ask
+        else:
+            is_ask = True            # SELL order on Lighter
+            limit_price = lite_bid   # strict limit: won't sell below current bid
+
+        base_amount = int(qty * self.base_amount_multiplier)
+        price_i = int(limit_price * self.price_multiplier)
+        if base_amount <= 0:
+            return False
+
+        async with self._lighter_signer_lock:
+            if not self.lighter_client:
+                self.initialize_lighter_client()
+            order_id = int(time.time() * 1000)
+            while order_id in self.lighter_client_order_to_trade_key:
+                order_id += 1
+            _, tx_hash, error = await self.lighter_client.create_order(
+                market_index=self.lighter_market_index,
+                client_order_index=order_id,
+                base_amount=base_amount,
+                price=price_i,
+                is_ask=is_ask,
+                order_type=self.lighter_client.ORDER_TYPE_LIMIT,
+                time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                reduce_only=False,
+                trigger_price=0,
+            )
+
+        if error:
+            self.logger.warning("Lite IOC close submit failed: %s", error)
+            return False
+
+        self._lite_close_order_id = order_id
+        self._lite_close_var_side = var_side
+        self._lite_close_qty = qty
+        self._lite_close_trigger_pct = trigger_pct
+        self._lite_close_signal_ts = utc_now()
+        self.logger.info(
+            "Lite IOC close submitted: order_id=%s side=%s limit=%.2f qty=%s",
+            order_id, "BUY" if not is_ask else "SELL", float(limit_price), qty,
+        )
+        return True
+
+    async def _pre_submit_lighter_taker(self, var_side: str, qty: Decimal) -> int | None:
+        """Submit Lighter taker order simultaneously with the Var order (open positions only).
+        Returns the client_order_id if submitted, None on failure."""
+        lite_bid, lite_ask = await self.get_lighter_best_bid_ask()
+        if lite_bid is None or lite_ask is None:
+            return None
+
+        # var_side="buy" → open L-Var/S-Lite → sell on Lighter (is_ask=True, use bid price)
+        # var_side="sell" → open S-Var/L-Lite → buy on Lighter (is_ask=False, use ask price)
+        if var_side == "buy":
+            is_ask = True
+            limit_price = lite_bid * (Decimal("1") - Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000"))
+        else:
+            is_ask = False
+            limit_price = lite_ask * (Decimal("1") + Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000"))
+
+        base_amount = int(qty * self.base_amount_multiplier)
+        if base_amount <= 0:
+            return None
+        price_i = int(limit_price * self.price_multiplier)
+
+        try:
+            async with self._lighter_signer_lock:
+                if not self.lighter_client:
+                    self.initialize_lighter_client()
+                order_id = int(time.time() * 1000)
+                while order_id in self.lighter_client_order_to_trade_key:
+                    order_id += 1
+                _, tx_hash, error = await self.lighter_client.create_order(
+                    market_index=self.lighter_market_index,
+                    client_order_index=order_id,
+                    base_amount=base_amount,
+                    price=price_i,
+                    is_ask=is_ask,
+                    order_type=self.lighter_client.ORDER_TYPE_LIMIT,
+                    time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_GOOD_TILL_TIME,
+                    reduce_only=False,
+                    trigger_price=0,
+                )
+            if error:
+                self.logger.warning("Pre-submit Lighter failed: %s", error)
+                return None
+            self.logger.info("Pre-submit Lighter ok: order_id=%s side=%s qty=%s price=%.2f",
+                             order_id, "SELL" if is_ask else "BUY", qty, float(limit_price))
+            return order_id
+        except Exception as exc:
+            self.logger.warning("Pre-submit Lighter exception: %s", exc)
+            return None
+
     def should_track_variational_event(self, event: dict[str, Any]) -> bool:
         side = str(event.get("side", "")).strip().lower()
         if side not in {"buy", "sell"}:
@@ -874,7 +1005,20 @@ class VariationalToLighterRuntime:
             await self.append_order_log("variational_fill", filled_payload)
 
         if created and created_record is not None and self.args.auto_hedge:
-            await self.place_lighter_order(created_record)
+            if self._pre_submitted_lite_order_id is not None:
+                # Lighter already submitted simultaneously — just link order_id to record
+                order_id = self._pre_submitted_lite_order_id
+                self._pre_submitted_lite_order_id = None
+                lite_side = "SELL" if created_record.side == "buy" else "BUY"
+                async with self._record_lock:
+                    created_record.lighter_side = lite_side
+                    created_record.lighter_client_order_id = order_id
+                    created_record.lighter_order_ts = utc_now()
+                    self.lighter_client_order_to_trade_key[order_id] = created_record.trade_key
+                self.logger.info("Linked pre-submitted Lighter order %s to trade %s",
+                                 order_id, created_record.trade_key)
+            else:
+                await self.place_lighter_order(created_record)
 
     async def trade_loop(self) -> None:
         while not self.stop_flag:
@@ -1060,14 +1204,16 @@ class VariationalToLighterRuntime:
             has_long = cur_qty > Decimal("0.000001")
             has_short = cur_qty < Decimal("-0.000001")
 
-            # Close opportunities take priority
+            # Close opportunities take priority — Lighter IOC first, Var on fill
             if has_long and short_pct is not None and short_pct >= close_threshold:
                 qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
-                await self._trigger_variational_order("sell", qty, short_pct, is_close=True)
+                if await self._submit_lite_close_ioc("sell", qty, short_pct):
+                    self._order_in_flight = True
                 continue
             if has_short and long_pct is not None and long_pct >= close_threshold:
                 qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
-                await self._trigger_variational_order("buy", qty, long_pct, is_close=True)
+                if await self._submit_lite_close_ioc("buy", qty, long_pct):
+                    self._order_in_flight = True
                 continue
 
             # Narrow-spread close: profitable when spread has narrowed by at least DELTA
@@ -1091,7 +1237,8 @@ class VariationalToLighterRuntime:
                         narrow_threshold = open_spread_pct - self.narrow_close_delta
                 if long_pct < narrow_threshold:
                     qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
-                    await self._trigger_variational_order("sell", qty, long_pct, is_close=True)
+                    if await self._submit_lite_close_ioc("sell", qty, long_pct):
+                        self._order_in_flight = True
                     continue
             if has_short and short_pct is not None:
                 narrow_threshold = self.narrow_close_pct  # fallback
@@ -1106,7 +1253,8 @@ class VariationalToLighterRuntime:
                         narrow_threshold = -(open_spread_pct - self.narrow_close_delta)
                 if short_pct > narrow_threshold:
                     qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
-                    await self._trigger_variational_order("buy", qty, short_pct, is_close=True)
+                    if await self._submit_lite_close_ioc("buy", qty, short_pct):
+                        self._order_in_flight = True
                     continue
 
             # Open new position only if total notional is within limit
@@ -1131,6 +1279,13 @@ class VariationalToLighterRuntime:
         self._pending_signal_ts = utc_now()   # T0: signal fired
         qty_str = format(qty, "f")
         action = "CLOSE" if is_close else "OPEN"
+
+        # Submit Lighter order simultaneously with Var (taker on both sides at once)
+        if self.args.auto_hedge and not is_close:
+            lite_order_id = await self._pre_submit_lighter_taker(side, qty)
+            if lite_order_id:
+                self._pre_submitted_lite_order_id = lite_order_id
+
         try:
             self.logger.info(
                 "Signal triggered (%s): side=%s qty=%s trigger_pct=%s%%",
