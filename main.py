@@ -289,9 +289,12 @@ class VariationalToLighterRuntime:
         self._lite_close_qty: Decimal | None = None
         self._lite_close_trigger_pct: Decimal | None = None
         self._lite_close_signal_ts: str | None = None
+        self._lite_close_submitted_mono: float = 0.0       # monotonic time of submission
 
         # Simultaneous submission: Lighter order sent at same time as Var
         self._pre_submitted_lite_order_id: int | None = None
+        self._pre_submitted_lite_side: str | None = None
+        self._pre_submitted_lite_qty: Decimal | None = None
         self._record_lock = asyncio.Lock()
         self.cross_spread_history: deque[tuple[float, float | None, float | None]] = deque()
         self._asset_switch_lock = asyncio.Lock()
@@ -501,9 +504,6 @@ class VariationalToLighterRuntime:
         await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
     async def handle_lighter_fill_update(self, order: dict[str, Any]) -> None:
-        if order.get("status") != "filled":
-            return
-
         client_order_id_raw = order.get("client_order_id")
         try:
             client_order_id = int(client_order_id_raw)
@@ -518,19 +518,31 @@ class VariationalToLighterRuntime:
 
         now_iso = utc_now()
 
-        # IOC close-first: Lighter filled before Var — now trigger Var close
-        if client_order_id == self._lite_close_order_id and fill_price is not None:
-            self.logger.info(
-                "Lite IOC close filled @ %.2f — triggering Var close (side=%s qty=%s)",
-                float(fill_price), self._lite_close_var_side, self._lite_close_qty,
-            )
-            var_side = self._lite_close_var_side
-            qty      = self._lite_close_qty
-            tpct     = self._lite_close_trigger_pct
-            self._lite_close_order_id = None  # clear pending state
-            asyncio.create_task(
-                self._trigger_variational_order(var_side, qty, tpct, is_close=True)
-            )
+        # IOC close-first: handle fill or cancellation for the pending close order
+        if client_order_id == self._lite_close_order_id:
+            if order.get("status") == "filled" and fill_price is not None:
+                self.logger.info(
+                    "Lite IOC close filled @ %.2f — triggering Var close (side=%s qty=%s)",
+                    float(fill_price), self._lite_close_var_side, self._lite_close_qty,
+                )
+                var_side = self._lite_close_var_side
+                qty      = self._lite_close_qty
+                tpct     = self._lite_close_trigger_pct
+                self._lite_close_order_id = None
+                asyncio.create_task(
+                    self._trigger_variational_order(var_side, qty, tpct, is_close=True)
+                )
+            else:
+                # IOC was cancelled or rejected — release the in-flight lock
+                self.logger.info(
+                    "Lite IOC close order %s not filled (status=%s) — resetting",
+                    client_order_id, order.get("status"),
+                )
+                self._lite_close_order_id = None
+                self._order_in_flight = False
+            return
+
+        if order.get("status") != "filled":
             return
 
         async with self._record_lock:
@@ -861,6 +873,7 @@ class VariationalToLighterRuntime:
         self._lite_close_qty = qty
         self._lite_close_trigger_pct = trigger_pct
         self._lite_close_signal_ts = utc_now()
+        self._lite_close_submitted_mono = time.monotonic()
         self.logger.info(
             "Lite IOC close submitted: order_id=%s side=%s limit=%.2f qty=%s",
             order_id, "BUY" if not is_ask else "SELL", float(limit_price), qty,
@@ -916,22 +929,105 @@ class VariationalToLighterRuntime:
             self.logger.warning("Pre-submit Lighter exception: %s", exc)
             return None
 
-    async def _cancel_lighter_order(self, order_id: int) -> None:
+    async def _close_unhedged_lighter_position(self, var_side: str, qty: Decimal) -> None:
+        """Reverse an unhedged Lighter fill by submitting an IOC close order."""
+        # var_side="buy" → Lighter was SELL (short) → close with BUY (is_ask=False)
+        # var_side="sell" → Lighter was BUY (long)  → close with SELL (is_ask=True)
+        is_ask = (var_side == "sell")
+        lite_bid, lite_ask = await self.get_lighter_best_bid_ask()
+        if lite_bid is None or lite_ask is None:
+            self.logger.error(
+                "UNHEDGED LIGHTER: order book unavailable to close position "
+                "(var_side=%s qty=%s) — manual action required", var_side, qty,
+            )
+            return
+        slippage = Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000")
+        limit_price = lite_bid * (Decimal("1") - slippage) if is_ask else lite_ask * (Decimal("1") + slippage)
+        base_amount = int(qty * self.base_amount_multiplier)
+        price_i = int(limit_price * self.price_multiplier)
+        if base_amount <= 0:
+            self.logger.error(
+                "UNHEDGED LIGHTER: qty rounds to zero (var_side=%s qty=%s) — manual action required",
+                var_side, qty,
+            )
+            return
         try:
             async with self._lighter_signer_lock:
                 if not self.lighter_client:
                     self.initialize_lighter_client()
-                _, _, error = await self.lighter_client.cancel_order(
+                close_id = int(time.time() * 1000)
+                _, _, error = await self.lighter_client.create_order(
+                    market_index=self.lighter_market_index,
+                    client_order_index=close_id,
+                    base_amount=base_amount,
+                    price=price_i,
+                    is_ask=is_ask,
+                    order_type=self.lighter_client.ORDER_TYPE_LIMIT,
+                    time_in_force=self.lighter_client.ORDER_TIME_IN_FORCE_IMMEDIATE_OR_CANCEL,
+                    reduce_only=False,
+                    trigger_price=0,
+                )
+            if error:
+                self.logger.error(
+                    "UNHEDGED LIGHTER: IOC close failed: %s (var_side=%s qty=%s) — manual action required",
+                    error, var_side, qty,
+                )
+            else:
+                self.logger.warning(
+                    "UNHEDGED LIGHTER: IOC close submitted (var_side=%s qty=%s close_id=%s)",
+                    var_side, qty, close_id,
+                )
+        except Exception as exc:
+            self.logger.error(
+                "UNHEDGED LIGHTER: exception closing position: %s — manual action required", exc,
+            )
+
+    async def _cancel_or_close_lighter_order(self, order_id: int, var_side: str, qty: Decimal) -> None:
+        """Cancel a pre-submitted Lighter order; if already filled, close the unhedged position."""
+        # Check if WS fill notification already arrived (race: fill before Variational failed)
+        already_filled = self._pending_lighter_fills.pop(order_id, None)
+        if already_filled is not None:
+            self.logger.warning(
+                "UNHEDGED LIGHTER: order %s filled before Variational — closing (var_side=%s qty=%s)",
+                order_id, var_side, qty,
+            )
+            await self._close_unhedged_lighter_position(var_side, qty)
+            return
+
+        # Fill not yet confirmed — try to cancel the open order
+        cancel_error: str | None = None
+        try:
+            async with self._lighter_signer_lock:
+                if not self.lighter_client:
+                    self.initialize_lighter_client()
+                _, _, cancel_error = await self.lighter_client.cancel_order(
                     market_index=self.lighter_market_index,
                     order_index=order_id,
                     api_key_index=self.api_key_index,
                 )
-            if error:
-                self.logger.warning("Failed to cancel orphaned Lighter order %s: %s", order_id, error)
-            else:
-                self.logger.info("Cancelled orphaned Lighter order %s", order_id)
         except Exception as exc:
-            self.logger.warning("Exception cancelling Lighter order %s: %s", order_id, exc)
+            cancel_error = str(exc)
+
+        if cancel_error is None:
+            self.logger.info("Cancelled orphaned Lighter order %s", order_id)
+            return
+
+        # Cancel failed — order may have filled between our check and cancel submission.
+        # Wait 1 s for the WS fill notification to arrive, then close if confirmed.
+        self.logger.warning("Lighter order %s cancel failed: %s — waiting for fill confirmation", order_id, cancel_error)
+        await asyncio.sleep(1.0)
+        already_filled = self._pending_lighter_fills.pop(order_id, None)
+        if already_filled is not None:
+            self.logger.warning(
+                "UNHEDGED LIGHTER: order %s fill confirmed after cancel failed — closing (var_side=%s qty=%s)",
+                order_id, var_side, qty,
+            )
+            await self._close_unhedged_lighter_position(var_side, qty)
+        else:
+            self.logger.error(
+                "UNHEDGED LIGHTER: order %s cancel failed and no fill confirmed — manual check required",
+                order_id,
+            )
 
     def should_track_variational_event(self, event: dict[str, Any]) -> bool:
         side = str(event.get("side", "")).strip().lower()
@@ -1029,6 +1125,8 @@ class VariationalToLighterRuntime:
                 # Lighter already submitted simultaneously — just link order_id to record
                 order_id = self._pre_submitted_lite_order_id
                 self._pre_submitted_lite_order_id = None
+                self._pre_submitted_lite_side = None
+                self._pre_submitted_lite_qty = None
                 lite_side = "SELL" if created_record.side == "buy" else "BUY"
                 pending_fill_order = None
                 async with self._record_lock:
@@ -1194,7 +1292,17 @@ class VariationalToLighterRuntime:
             await asyncio.sleep(0.5)
 
             if self._order_in_flight:
-                continue
+                # Watchdog: if close IOC has been pending >30 s with no WS update, force-reset
+                if (self._lite_close_order_id is not None
+                        and time.monotonic() - self._lite_close_submitted_mono > 30.0):
+                    self.logger.warning(
+                        "Close IOC order %s timed out with no WS update — resetting",
+                        self._lite_close_order_id,
+                    )
+                    self._lite_close_order_id = None
+                    self._order_in_flight = False
+                else:
+                    continue
             if time.monotonic() - self._last_variational_order_ts < self.order_cooldown_seconds:
                 continue
 
@@ -1298,7 +1406,7 @@ class VariationalToLighterRuntime:
     async def _trigger_variational_order(
         self, side: str, qty: Decimal, trigger_pct: Decimal, is_close: bool = False
     ) -> None:
-        if self._order_in_flight:
+        if self._order_in_flight and not is_close:
             return
         self._order_in_flight = True
         self._pending_signal_ts = utc_now()   # T0: signal fired
@@ -1308,13 +1416,20 @@ class VariationalToLighterRuntime:
         # Cancel any stale pre-submitted order left over from a previous failed Variational attempt
         if self._pre_submitted_lite_order_id is not None:
             stale_id = self._pre_submitted_lite_order_id
+            stale_side = self._pre_submitted_lite_side or side
+            stale_qty = self._pre_submitted_lite_qty or qty
             self._pre_submitted_lite_order_id = None
-            asyncio.create_task(self._cancel_lighter_order(stale_id))
+            self._pre_submitted_lite_side = None
+            self._pre_submitted_lite_qty = None
+            asyncio.create_task(self._cancel_or_close_lighter_order(stale_id, stale_side, stale_qty))
 
         # Submit Lighter order simultaneously with Var (taker on both sides at once)
         if self.args.auto_hedge and not is_close:
             lite_order_id = await self._pre_submit_lighter_taker(side, qty)
             self._pre_submitted_lite_order_id = lite_order_id  # None if pre-submit failed
+            if lite_order_id is not None:
+                self._pre_submitted_lite_side = side
+                self._pre_submitted_lite_qty = qty
 
         try:
             self.logger.info(
@@ -1346,13 +1461,17 @@ class VariationalToLighterRuntime:
                 if self._pre_submitted_lite_order_id is not None:
                     orphan_id = self._pre_submitted_lite_order_id
                     self._pre_submitted_lite_order_id = None
-                    asyncio.create_task(self._cancel_lighter_order(orphan_id))
+                    self._pre_submitted_lite_side = None
+                    self._pre_submitted_lite_qty = None
+                    asyncio.create_task(self._cancel_or_close_lighter_order(orphan_id, side, qty))
         except Exception as exc:
             self.logger.error("Variational order error: %s", exc)
             if self._pre_submitted_lite_order_id is not None:
                 orphan_id = self._pre_submitted_lite_order_id
                 self._pre_submitted_lite_order_id = None
-                asyncio.create_task(self._cancel_lighter_order(orphan_id))
+                self._pre_submitted_lite_side = None
+                self._pre_submitted_lite_qty = None
+                asyncio.create_task(self._cancel_or_close_lighter_order(orphan_id, side, qty))
         finally:
             self._order_in_flight = False
 
