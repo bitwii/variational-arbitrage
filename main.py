@@ -279,6 +279,7 @@ class VariationalToLighterRuntime:
         self.records: dict[str, OrderLifecycle] = {}
         self.record_order: deque[str] = deque(maxlen=500)
         self.lighter_client_order_to_trade_key: dict[int, str] = {}
+        self._pending_lighter_fills: dict[int, dict[str, Any]] = {}  # fills that arrived before mapping
         self._open_trade_queue: deque[str] = deque()  # FIFO queue of unmatched open keys
         self._pending_signal_ts: str | None = None    # T0 passed from signal_loop to trade handler
 
@@ -535,6 +536,8 @@ class VariationalToLighterRuntime:
         async with self._record_lock:
             trade_key = self.lighter_client_order_to_trade_key.get(client_order_id)
             if not trade_key:
+                # Lighter filled before Variational fill was processed and linked — buffer it
+                self._pending_lighter_fills[client_order_id] = order
                 return
             record = self.records.get(trade_key)
             if record is None:
@@ -913,6 +916,23 @@ class VariationalToLighterRuntime:
             self.logger.warning("Pre-submit Lighter exception: %s", exc)
             return None
 
+    async def _cancel_lighter_order(self, order_id: int) -> None:
+        try:
+            async with self._lighter_signer_lock:
+                if not self.lighter_client:
+                    self.initialize_lighter_client()
+                _, _, error = await self.lighter_client.cancel_order(
+                    market_index=self.lighter_market_index,
+                    order_index=order_id,
+                    api_key_index=self.api_key_index,
+                )
+            if error:
+                self.logger.warning("Failed to cancel orphaned Lighter order %s: %s", order_id, error)
+            else:
+                self.logger.info("Cancelled orphaned Lighter order %s", order_id)
+        except Exception as exc:
+            self.logger.warning("Exception cancelling Lighter order %s: %s", order_id, exc)
+
     def should_track_variational_event(self, event: dict[str, Any]) -> bool:
         side = str(event.get("side", "")).strip().lower()
         if side not in {"buy", "sell"}:
@@ -1010,13 +1030,18 @@ class VariationalToLighterRuntime:
                 order_id = self._pre_submitted_lite_order_id
                 self._pre_submitted_lite_order_id = None
                 lite_side = "SELL" if created_record.side == "buy" else "BUY"
+                pending_fill_order = None
                 async with self._record_lock:
                     created_record.lighter_side = lite_side
                     created_record.lighter_client_order_id = order_id
                     created_record.lighter_order_ts = utc_now()
                     self.lighter_client_order_to_trade_key[order_id] = created_record.trade_key
+                    pending_fill_order = self._pending_lighter_fills.pop(order_id, None)
                 self.logger.info("Linked pre-submitted Lighter order %s to trade %s",
                                  order_id, created_record.trade_key)
+                if pending_fill_order is not None:
+                    # Fill arrived before mapping — replay now that mapping is established
+                    await self.handle_lighter_fill_update(pending_fill_order)
             else:
                 await self.place_lighter_order(created_record)
 
@@ -1280,11 +1305,16 @@ class VariationalToLighterRuntime:
         qty_str = format(qty, "f")
         action = "CLOSE" if is_close else "OPEN"
 
+        # Cancel any stale pre-submitted order left over from a previous failed Variational attempt
+        if self._pre_submitted_lite_order_id is not None:
+            stale_id = self._pre_submitted_lite_order_id
+            self._pre_submitted_lite_order_id = None
+            asyncio.create_task(self._cancel_lighter_order(stale_id))
+
         # Submit Lighter order simultaneously with Var (taker on both sides at once)
         if self.args.auto_hedge and not is_close:
             lite_order_id = await self._pre_submit_lighter_taker(side, qty)
-            if lite_order_id:
-                self._pre_submitted_lite_order_id = lite_order_id
+            self._pre_submitted_lite_order_id = lite_order_id  # None if pre-submit failed
 
         try:
             self.logger.info(
@@ -1313,8 +1343,16 @@ class VariationalToLighterRuntime:
                 self.logger.info("Variational order ok (%s): side=%s qty=%s rfq_id=%s", action, side, qty_str, rfq_id)
             else:
                 self.logger.warning("Variational order failed (%s): side=%s qty=%s error=%s", action, side, qty_str, result.get("error"))
+                if self._pre_submitted_lite_order_id is not None:
+                    orphan_id = self._pre_submitted_lite_order_id
+                    self._pre_submitted_lite_order_id = None
+                    asyncio.create_task(self._cancel_lighter_order(orphan_id))
         except Exception as exc:
             self.logger.error("Variational order error: %s", exc)
+            if self._pre_submitted_lite_order_id is not None:
+                orphan_id = self._pre_submitted_lite_order_id
+                self._pre_submitted_lite_order_id = None
+                asyncio.create_task(self._cancel_lighter_order(orphan_id))
         finally:
             self._order_in_flight = False
 
