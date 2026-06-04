@@ -254,6 +254,7 @@ class VariationalToLighterRuntime:
         self.close_multiplier = Decimal(os.getenv("VAR_CLOSE_MULTIPLIER", "1.0"))
         self.narrow_close_pct = Decimal(os.getenv("VAR_NARROW_CLOSE_PCT", "0.01"))
         self.narrow_close_delta = Decimal(os.getenv("VAR_NARROW_CLOSE_DELTA_PCT", "0.02"))
+        self.min_open_spread_pct = Decimal(os.getenv("VAR_MIN_OPEN_SPREAD_PCT", "0"))
         self.max_price_deviation_pct = Decimal(os.getenv("VAR_MAX_PRICE_DEVIATION_PCT", "10"))
         self.order_notional_usdc = Decimal(os.getenv("VAR_ORDER_NOTIONAL_USDC", "300"))
         self.order_cooldown_seconds = float(os.getenv("VAR_ORDER_COOLDOWN_SECONDS", "120"))
@@ -1082,10 +1083,10 @@ class VariationalToLighterRuntime:
             if actual_total + self.order_notional_usdc > self.max_total_notional_usdc:
                 continue
 
-            if long_pct is not None and long_pct >= open_threshold:
+            if long_pct is not None and long_pct >= open_threshold and long_pct >= self.min_open_spread_pct:
                 qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
                 await self._trigger_variational_order("buy", qty, long_pct)
-            elif short_pct is not None and short_pct >= open_threshold:
+            elif short_pct is not None and short_pct >= open_threshold and short_pct >= self.min_open_spread_pct:
                 qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
                 await self._trigger_variational_order("sell", qty, short_pct)
 
@@ -1347,8 +1348,9 @@ class VariationalToLighterRuntime:
                 color = "green" if val > 0 else "red"
                 return f"[{color}]{val:+.2f}[/{color}]"
 
+            min_floor_text = f"  绝对门槛≥[bold]{self.min_open_spread_pct:.4f}%[/bold]" if self.min_open_spread_pct > 0 else ""
             threshold_text = (
-                f"开仓阈值≥[bold]{open_thr:.4f}%[/bold]({open_thr_abs:.2f}U)  "
+                f"开仓阈值≥[bold]{open_thr:.4f}%[/bold]({open_thr_abs:.2f}U){min_floor_text}  "
                 f"平仓阈值≥[bold]{close_thr:.4f}%[/bold]({close_thr_abs:.2f}U)  "
                 f"收窄平仓<[bold]{self.narrow_close_pct:.2f}%[/bold]  │  "
                 f"当前价差 多{_fmt_spread(long_var_short_lighter_pct)}({_fmt_abs(long_abs)}) "
