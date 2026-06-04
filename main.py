@@ -234,8 +234,8 @@ class VariationalToLighterRuntime:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(APP_LOG_FILE, encoding="utf-8")
         _cst = timezone(timedelta(hours=8))
-        _fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
-        _fmt.formatTime = lambda record, datefmt=None: datetime.fromtimestamp(record.created, tz=_cst).strftime("%Y-%m-%d %H:%M:%S,%f")[:-3]
+        _fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(filename)s:%(lineno)d | %(message)s")
+        _fmt.formatTime = lambda record, datefmt=None: datetime.fromtimestamp(record.created, tz=_cst).strftime("%y/%m/%d %H:%M:%S,%f")[:-3]
         file_handler.setFormatter(_fmt)
         self.logger.addHandler(file_handler)
         self.dashboard_console = Console()
@@ -1099,8 +1099,9 @@ class VariationalToLighterRuntime:
         action = "CLOSE" if is_close else "OPEN"
         try:
             self.logger.info(
-                "Signal triggered (%s): side=%s qty=%s trigger_pct=%s%%",
+                "Signal triggered (%s): side=%s qty=%s spread=%.4f%% long_exp=%sU short_exp=%sU",
                 action, side, qty_str, trigger_pct,
+                self._open_long_notional, self._open_short_notional,
             )
             result = await self.runtime.broker.place_order_internal(
                 side=side,
@@ -1121,7 +1122,11 @@ class VariationalToLighterRuntime:
                     else:
                         self._open_short_notional += self.order_notional_usdc
                 rfq_id = (result.get("data") or {}).get("rfq_id", "-")
-                self.logger.info("Variational order ok (%s): side=%s qty=%s rfq_id=%s", action, side, qty_str, rfq_id)
+                self.logger.info(
+                    "Variational order ok (%s): side=%s qty=%s rfq_id=%s → long_exp=%sU short_exp=%sU",
+                    action, side, qty_str, rfq_id,
+                    self._open_long_notional, self._open_short_notional,
+                )
             else:
                 self.logger.warning("Variational order failed (%s): side=%s qty=%s error=%s", action, side, qty_str, result.get("error"))
         except Exception as exc:
