@@ -256,7 +256,7 @@ class VariationalToLighterRuntime:
         self.narrow_close_delta = Decimal(os.getenv("VAR_NARROW_CLOSE_DELTA_PCT", "0.02"))
         self.max_price_deviation_pct = Decimal(os.getenv("VAR_MAX_PRICE_DEVIATION_PCT", "10"))
         self.order_notional_usdc = Decimal(os.getenv("VAR_ORDER_NOTIONAL_USDC", "300"))
-        self.order_cooldown_seconds = float(os.getenv("VAR_ORDER_COOLDOWN_SECONDS", "300"))
+        self.order_cooldown_seconds = float(os.getenv("VAR_ORDER_COOLDOWN_SECONDS", "120"))
         self.max_total_notional_usdc = Decimal(os.getenv("VAR_MAX_TOTAL_NOTIONAL_USDC", "1000"))
         self._open_long_notional: Decimal = Decimal("0")
         self._open_short_notional: Decimal = Decimal("0")
@@ -1109,8 +1109,8 @@ class VariationalToLighterRuntime:
                 max_slippage=0.01,
                 is_reduce_only=is_close,
             )
-            self._last_variational_order_ts = time.monotonic()
             if result.get("ok"):
+                self._last_variational_order_ts = time.monotonic()
                 if is_close:
                     if side == "sell":
                         self._open_long_notional = max(Decimal("0"), self._open_long_notional - self.order_notional_usdc)
