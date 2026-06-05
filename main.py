@@ -1129,8 +1129,10 @@ class VariationalToLighterRuntime:
                     self._open_long_notional, self._open_short_notional,
                 )
             else:
+                self._last_variational_order_ts = time.monotonic()
                 self.logger.warning("Variational order failed (%s): side=%s qty=%s error=%s", action, side, qty_str, result.get("error"))
         except Exception as exc:
+            self._last_variational_order_ts = time.monotonic()
             self.logger.error("Variational order error: %s", exc)
         finally:
             self._order_in_flight = False
