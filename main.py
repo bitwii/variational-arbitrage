@@ -997,6 +997,7 @@ class VariationalToLighterRuntime:
             )
 
     async def signal_loop(self) -> None:
+        await asyncio.sleep(float(os.getenv("VAR_SIGNAL_STARTUP_DELAY_SECONDS", "15")))
         while not self.stop_flag:
             await asyncio.sleep(0.5)
 
