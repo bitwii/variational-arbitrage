@@ -261,6 +261,9 @@ class VariationalToLighterRuntime:
         self.max_total_notional_usdc = Decimal(os.getenv("VAR_MAX_TOTAL_NOTIONAL_USDC", "1000"))
         self._open_long_notional: Decimal = Decimal("0")
         self._open_short_notional: Decimal = Decimal("0")
+        self._lighter_actual_qty: Decimal = Decimal("0")  # signed qty synced from Lighter REST (negative=short)
+        self._lighter_sync_interval: float = float(os.getenv("VAR_LIGHTER_SYNC_INTERVAL_SECONDS", "60"))
+        self._single_leg_blocked: bool = False
         self._last_variational_order_ts: float = 0.0
         self._order_in_flight: bool = False
         self.signal_task: asyncio.Task[None] | None = None
@@ -308,6 +311,7 @@ class VariationalToLighterRuntime:
         self.lighter_ws_task: asyncio.Task[None] | None = None
         self.trade_task: asyncio.Task[None] | None = None
         self.dashboard_task: asyncio.Task[None] | None = None
+        self._lighter_sync_task: asyncio.Task[None] | None = None
 
     def print_startup_next_steps(self) -> None:
         is_zh = self.args.lang == "zh"
@@ -697,6 +701,25 @@ class VariationalToLighterRuntime:
 
         side = "SELL" if record.side == "buy" else "BUY"
 
+        # Guard: prevent creating an orphan Lighter position when the hedge leg is already gone.
+        # A Lighter BUY is only a legitimate open when Var is short (opening long hedge).
+        # If Var is flat or long, the BUY should close an existing short — but if there's no
+        # short (manually closed or never opened), the BUY would create a spurious long.
+        if side == "BUY" and self._lighter_actual_qty >= Decimal("-0.001"):
+            cur_pos = self.runtime.monitor.positions.get(self.variational_ticker or "", {})
+            var_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
+            if var_qty > Decimal("-0.001"):
+                self.logger.warning(
+                    "Lighter BUY hedge skipped — no short to close (lighter_qty=%s, var_qty=%s); "
+                    "single-leg protection prevented orphan position",
+                    self._lighter_actual_qty, var_qty,
+                )
+                async with self._record_lock:
+                    record.hedge_error = "skipped_no_lighter_short"
+                    payload = record.to_payload()
+                await self.append_order_log("lighter_error", payload)
+                return
+
         best_bid, best_ask = await self.get_lighter_best_bid_ask()
         if best_bid is None or best_ask is None:
             async with self._record_lock:
@@ -752,6 +775,11 @@ class VariationalToLighterRuntime:
                 record.lighter_tx_hash = tx_hash
                 record.hedge_error = None
                 self.lighter_client_order_to_trade_key[client_order_id] = record.trade_key
+            # Optimistically update cached Lighter qty so the guard stays accurate between syncs
+            if side == "SELL":
+                self._lighter_actual_qty -= record.qty
+            else:
+                self._lighter_actual_qty += record.qty
         except Exception as exc:
             async with self._record_lock:
                 record.lighter_side = side
@@ -945,6 +973,7 @@ class VariationalToLighterRuntime:
         # ── Lighter side (REST API, authoritative) ──────────────────────────
         lighter_long_notional = Decimal("0")
         lighter_short_notional = Decimal("0")
+        lighter_raw_qty = Decimal("0")
         try:
             api_client = ApiClient(configuration=Configuration(host=self.lighter_base_url))
             account_api = AccountApi(api_client)
@@ -958,6 +987,7 @@ class VariationalToLighterRuntime:
                     qty = Decimal(str(pos.position))
                     if abs(qty) < Decimal("0.000001"):
                         continue
+                    lighter_raw_qty = qty
                     value = abs(Decimal(str(pos.position_value)))
                     if qty < 0:
                         lighter_long_notional = value
@@ -965,6 +995,7 @@ class VariationalToLighterRuntime:
                         lighter_short_notional = value
         except Exception as exc:
             self.logger.warning("Failed to query Lighter initial position: %s", exc)
+        self._lighter_actual_qty = lighter_raw_qty
 
         # ── Variational side (monitor portfolio stream) ──────────────────────
         var_pos = self.runtime.monitor.positions.get(self.variational_ticker)
@@ -995,6 +1026,58 @@ class VariationalToLighterRuntime:
                 "Initial open notional set: long=%s USDC short=%s USDC",
                 lighter_long_notional, lighter_short_notional,
             )
+
+    async def _fetch_lighter_position_qty(self) -> Decimal | None:
+        try:
+            from lighter import ApiClient, Configuration, AccountApi
+            api_client = ApiClient(configuration=Configuration(host=self.lighter_base_url))
+            account_api = AccountApi(api_client)
+            account_data = await account_api.account(by="index", value=str(self.account_index))
+            await api_client.close()
+            if account_data and account_data.accounts:
+                acc = account_data.accounts[0]
+                for pos in (acc.positions or []):
+                    if pos.market_id != self.lighter_market_index:
+                        continue
+                    return Decimal(str(pos.position))
+            return Decimal("0")
+        except Exception as exc:
+            self.logger.warning("Lighter position sync failed: %s", exc)
+            return None
+
+    async def lighter_sync_loop(self) -> None:
+        while not self.stop_flag:
+            await asyncio.sleep(self._lighter_sync_interval)
+            lighter_qty = await self._fetch_lighter_position_qty()
+            if lighter_qty is None:
+                continue
+            self._lighter_actual_qty = lighter_qty
+
+            cur_pos = self.runtime.monitor.positions.get(self.variational_ticker or "", {})
+            var_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
+            var_long = var_qty > Decimal("0.001")
+            var_short = var_qty < Decimal("-0.001")
+            lt_short = lighter_qty < Decimal("-0.001")
+            lt_long = lighter_qty > Decimal("0.001")
+
+            single_leg = (
+                (var_long and not lt_short)
+                or (var_short and not lt_long)
+                or (not var_long and not var_short and abs(lighter_qty) > Decimal("0.001"))
+            )
+            if single_leg:
+                self._single_leg_blocked = True
+                self.logger.warning(
+                    "SINGLE-LEG DETECTED: var_qty=%s lighter_qty=%s — new opens blocked",
+                    var_qty, lighter_qty,
+                )
+            else:
+                if self._single_leg_blocked:
+                    self.logger.info(
+                        "Single-leg cleared: var_qty=%s lighter_qty=%s — opens unblocked",
+                        var_qty, lighter_qty,
+                    )
+                self._single_leg_blocked = False
 
     async def signal_loop(self) -> None:
         await asyncio.sleep(float(os.getenv("VAR_SIGNAL_STARTUP_DELAY_SECONDS", "15")))
@@ -1079,6 +1162,10 @@ class VariationalToLighterRuntime:
                     qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
                     await self._trigger_variational_order("buy", qty, short_pct, is_close=True)
                     continue
+
+            # Block opens if single-leg mismatch is detected
+            if self._single_leg_blocked:
+                continue
 
             # Open new position only if total notional is within limit
             if actual_total + self.order_notional_usdc > self.max_total_notional_usdc:
@@ -1629,6 +1716,7 @@ class VariationalToLighterRuntime:
         self.signal_task = asyncio.create_task(self.signal_loop())
         self.bbo_task = asyncio.create_task(self.bbo_loop())
         self.dashboard_task = asyncio.create_task(self.dashboard_loop())
+        self._lighter_sync_task = asyncio.create_task(self.lighter_sync_loop())
 
         while not self.stop_flag:
             await asyncio.sleep(0.25)
@@ -1647,6 +1735,10 @@ class VariationalToLighterRuntime:
         if self.bbo_task and not self.bbo_task.done():
             self.bbo_task.cancel()
             await asyncio.gather(self.bbo_task, return_exceptions=True)
+
+        if self._lighter_sync_task and not self._lighter_sync_task.done():
+            self._lighter_sync_task.cancel()
+            await asyncio.gather(self._lighter_sync_task, return_exceptions=True)
 
         if self.trade_task and not self.trade_task.done():
             self.trade_task.cancel()
