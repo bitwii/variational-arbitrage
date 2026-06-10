@@ -265,6 +265,8 @@ class VariationalToLighterRuntime:
         self._lighter_sync_interval: float = float(os.getenv("VAR_LIGHTER_SYNC_INTERVAL_SECONDS", "60"))
         self._single_leg_blocked: bool = False
         self._last_variational_order_ts: float = 0.0
+        self._injection_fail_count: int = 0
+        self._injection_fail_last_log_ts: float = 0.0
         self._order_in_flight: bool = False
         self.signal_task: asyncio.Task[None] | None = None
         self.bbo_task: asyncio.Task[None] | None = None
@@ -820,7 +822,6 @@ class VariationalToLighterRuntime:
         fill_iso = str(event.get("timestamp") or now_iso)
 
         created = False
-        created_record: OrderLifecycle | None = None
 
         async with self._record_lock:
             record = self.records.get(key)
@@ -837,7 +838,6 @@ class VariationalToLighterRuntime:
                 self.records[key] = record
                 self.record_order.append(key)
                 created = True
-                created_record = record
             else:
                 previous_status = record.last_variational_status
                 record.last_variational_status = status
@@ -878,8 +878,13 @@ class VariationalToLighterRuntime:
         if filled_payload is not None:
             await self.append_order_log("variational_fill", filled_payload)
 
-        if created and created_record is not None and self.args.auto_hedge:
-            await self.place_lighter_order(created_record)
+        # Trigger hedge on fill confirmation (not on record creation), so fills that arrive
+        # on a previously-seen key (status transition) are never silently skipped.
+        if self.args.auto_hedge and filled_payload is not None:
+            async with self._record_lock:
+                need_hedge = record.lighter_side is None and record.hedge_error is None
+            if need_hedge:
+                await self.place_lighter_order(record)
 
     async def trade_loop(self) -> None:
         while not self.stop_flag:
@@ -1190,11 +1195,13 @@ class VariationalToLighterRuntime:
         qty_str = format(qty, "f")
         action = "CLOSE" if is_close else "OPEN"
         try:
-            self.logger.info(
-                "Signal triggered (%s): side=%s qty=%s spread=%.4f%% long_exp=%sU short_exp=%sU",
-                action, side, qty_str, trigger_pct,
-                self._open_long_notional, self._open_short_notional,
-            )
+            # Suppress "Signal triggered" noise while injection is consistently failing
+            if self._injection_fail_count == 0:
+                self.logger.info(
+                    "Signal triggered (%s): side=%s qty=%s spread=%.4f%% long_exp=%sU short_exp=%sU",
+                    action, side, qty_str, trigger_pct,
+                    self._open_long_notional, self._open_short_notional,
+                )
             result = await self.runtime.broker.place_order_internal(
                 side=side,
                 amount=qty_str,
@@ -1203,6 +1210,8 @@ class VariationalToLighterRuntime:
             )
             if result.get("ok"):
                 self._last_variational_order_ts = time.monotonic()
+                self._injection_fail_count = 0
+                self._injection_fail_last_log_ts = 0.0
                 if is_close:
                     if side == "sell":
                         self._open_long_notional = max(Decimal("0"), self._open_long_notional - self.order_notional_usdc)
@@ -1215,15 +1224,31 @@ class VariationalToLighterRuntime:
                         self._open_short_notional += self.order_notional_usdc
                 rfq_id = (result.get("data") or {}).get("rfq_id", "-")
                 self.logger.info(
-                    "Variational order ok (%s): side=%s qty=%s rfq_id=%s → long_exp=%sU short_exp=%sU",
-                    action, side, qty_str, rfq_id,
+                    "Variational order ok (%s): side=%s qty=%s spread=%.4f%% rfq_id=%s → long_exp=%sU short_exp=%sU",
+                    action, side, qty_str, trigger_pct, rfq_id,
                     self._open_long_notional, self._open_short_notional,
                 )
             else:
                 self._last_variational_order_ts = time.monotonic()
-                self.logger.warning("Variational order failed (%s): side=%s qty=%s error=%s", action, side, qty_str, result.get("error"))
+                error_msg = str(result.get("error", ""))
+                if "Injection failed" in error_msg:
+                    self._injection_fail_count += 1
+                    since_last = time.monotonic() - self._injection_fail_last_log_ts
+                    if self._injection_fail_count == 1 or since_last >= 600:
+                        self.logger.warning(
+                            "Variational injection failing (%s): side=%s spread=%.4f%% [attempt #%d]",
+                            action, side, trigger_pct, self._injection_fail_count,
+                        )
+                        self._injection_fail_last_log_ts = time.monotonic()
+                else:
+                    self._injection_fail_count = 0
+                    self.logger.warning(
+                        "Variational order failed (%s): side=%s qty=%s error=%s",
+                        action, side, qty_str, error_msg,
+                    )
         except Exception as exc:
             self._last_variational_order_ts = time.monotonic()
+            self._injection_fail_count = 0
             self.logger.error("Variational order error: %s", exc)
         finally:
             self._order_in_flight = False
