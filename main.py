@@ -702,10 +702,10 @@ class VariationalToLighterRuntime:
         side = "SELL" if record.side == "buy" else "BUY"
 
         # Guard: prevent creating an orphan Lighter position when the hedge leg is already gone.
-        # A Lighter BUY is only a legitimate open when Var is short (opening long hedge).
-        # If Var is flat or long, the BUY should close an existing short — but if there's no
-        # short (manually closed or never opened), the BUY would create a spurious long.
-        if side == "BUY" and self._lighter_actual_qty >= Decimal("-0.001"):
+        # Lighter API convention: positive qty = SHORT, negative qty = LONG.
+        # A Lighter BUY closes an existing SHORT (positive qty). If there's no short, the BUY
+        # would create a spurious LONG — only skip if Var is also not short (not a legitimate open).
+        if side == "BUY" and self._lighter_actual_qty <= Decimal("0.001"):
             cur_pos = self.runtime.monitor.positions.get(self.variational_ticker or "", {})
             var_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
             if var_qty > Decimal("-0.001"):
@@ -775,11 +775,12 @@ class VariationalToLighterRuntime:
                 record.lighter_tx_hash = tx_hash
                 record.hedge_error = None
                 self.lighter_client_order_to_trade_key[client_order_id] = record.trade_key
-            # Optimistically update cached Lighter qty so the guard stays accurate between syncs
+            # Optimistically update cached Lighter qty so the guard stays accurate between syncs.
+            # Lighter API convention: positive = SHORT. SELL opens short (more positive), BUY closes it.
             if side == "SELL":
-                self._lighter_actual_qty -= record.qty
-            else:
                 self._lighter_actual_qty += record.qty
+            else:
+                self._lighter_actual_qty -= record.qty
         except Exception as exc:
             async with self._record_lock:
                 record.lighter_side = side
@@ -989,10 +990,11 @@ class VariationalToLighterRuntime:
                         continue
                     lighter_raw_qty = qty
                     value = abs(Decimal(str(pos.position_value)))
-                    if qty < 0:
-                        lighter_long_notional = value
+                    # Lighter API convention: positive qty = SHORT position
+                    if qty > 0:
+                        lighter_long_notional = value   # Lighter SHORT → hedges Var LONG
                     else:
-                        lighter_short_notional = value
+                        lighter_short_notional = value  # Lighter LONG → hedges Var SHORT
         except Exception as exc:
             self.logger.warning("Failed to query Lighter initial position: %s", exc)
         self._lighter_actual_qty = lighter_raw_qty
@@ -1057,8 +1059,9 @@ class VariationalToLighterRuntime:
             var_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
             var_long = var_qty > Decimal("0.001")
             var_short = var_qty < Decimal("-0.001")
-            lt_short = lighter_qty < Decimal("-0.001")
-            lt_long = lighter_qty > Decimal("0.001")
+            # Lighter API convention: positive qty = SHORT position, negative qty = LONG position
+            lt_short = lighter_qty > Decimal("0.001")
+            lt_long = lighter_qty < Decimal("-0.001")
 
             single_leg = (
                 (var_long and not lt_short)
