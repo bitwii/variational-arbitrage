@@ -268,6 +268,9 @@ class VariationalToLighterRuntime:
         self._injection_fail_count: int = 0
         self._injection_fail_last_log_ts: float = 0.0
         self._order_in_flight: bool = False
+        # (side, monotonic_ts) entries for orders whose Lighter hedge was already placed
+        # by signal_loop; trade_loop checks this to avoid double-hedging when fill event arrives.
+        self._pre_hedged: list[tuple[str, float]] = []
         self.signal_task: asyncio.Task[None] | None = None
         self.bbo_task: asyncio.Task[None] | None = None
         self._bbo_log_interval = int(os.getenv("VAR_BBO_LOG_INTERVAL_SECONDS", "600"))
@@ -878,13 +881,27 @@ class VariationalToLighterRuntime:
         if filled_payload is not None:
             await self.append_order_log("variational_fill", filled_payload)
 
-        # Trigger hedge on fill confirmation (not on record creation), so fills that arrive
-        # on a previously-seen key (status transition) are never silently skipped.
+        # Trigger hedge on fill confirmation only if signal_loop hasn't already pre-hedged it.
+        # signal_loop places the Lighter hedge immediately on order acknowledgement (because
+        # reduce-only fill events are not reliably delivered).  We consume one _pre_hedged
+        # token per fill event so that legitimate second fills of a different order are still hedged.
         if self.args.auto_hedge and filled_payload is not None:
             async with self._record_lock:
                 need_hedge = record.lighter_side is None and record.hedge_error is None
             if need_hedge:
-                await self.place_lighter_order(record)
+                now_mono = time.monotonic()
+                already_hedged = False
+                for i, (ph_side, ph_ts) in enumerate(self._pre_hedged):
+                    if ph_side == record.side and now_mono - ph_ts < 180:
+                        self._pre_hedged.pop(i)
+                        already_hedged = True
+                        self.logger.debug(
+                            "Hedge skipped — pre-hedged by signal_loop (side=%s key=%s)",
+                            record.side, record.trade_key,
+                        )
+                        break
+                if not already_hedged:
+                    await self.place_lighter_order(record)
 
     async def trade_loop(self) -> None:
         while not self.stop_flag:
@@ -1228,6 +1245,33 @@ class VariationalToLighterRuntime:
                     action, side, qty_str, trigger_pct, rfq_id,
                     self._open_long_notional, self._open_short_notional,
                 )
+                # Place Lighter hedge immediately — Variational fill events are not
+                # reliably delivered (reduce-only closes sometimes produce no event),
+                # so we cannot wait for trade_loop to trigger the hedge.
+                if self.args.auto_hedge:
+                    pending_key = rfq_id[:8] if rfq_id and rfq_id != "-" else f"rfq:{int(time.monotonic()*1000)}"
+                    pending_rec = OrderLifecycle(
+                        trade_key=pending_key,
+                        trade_id=rfq_id if rfq_id != "-" else pending_key,
+                        side=side,
+                        qty=qty,
+                        asset=self.variational_ticker or "ETH",
+                        auto_hedge_enabled=True,
+                        last_variational_status="filled",
+                    )
+                    pending_rec.var_fill_ts_iso = utc_now()
+                    async with self._record_lock:
+                        if pending_key not in self.records:
+                            self.records[pending_key] = pending_rec
+                            self.record_order.append(pending_key)
+                    await self.append_order_log("variational_fill", pending_rec.to_payload())
+                    await self.place_lighter_order(pending_rec)
+                    # Only mark as pre-hedged if the Lighter order was actually placed.
+                    # If it failed, trade_loop should still try when the fill event arrives.
+                    if pending_rec.lighter_side is not None and pending_rec.hedge_error is None:
+                        now_mono = time.monotonic()
+                        self._pre_hedged.append((side, now_mono))
+                        self._pre_hedged = [(s, t) for s, t in self._pre_hedged if now_mono - t < 180]
             else:
                 self._last_variational_order_ts = time.monotonic()
                 error_msg = str(result.get("error", ""))
