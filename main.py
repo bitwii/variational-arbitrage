@@ -1136,10 +1136,14 @@ class VariationalToLighterRuntime:
 
             # Actual positions from exchange (source of truth)
             all_pos = self.runtime.monitor.positions
-            actual_total = sum(
-                abs(to_decimal(p.get("value")) or Decimal("0"))
-                for p in all_pos.values()
-            )
+            def _pos_notional(p: dict) -> Decimal:
+                v = to_decimal(p.get("value"))
+                if v is not None:
+                    return abs(v)
+                # value field unparseable (e.g. "$1,628.83"); estimate from qty × price
+                qty = abs(to_decimal(p.get("qty")) or Decimal("0"))
+                return qty * var_mid
+            actual_total = sum(_pos_notional(p) for p in all_pos.values())
             cur_pos = all_pos.get(self.variational_ticker, {})
             cur_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
             has_long = cur_qty > Decimal("0.000001")
@@ -1485,10 +1489,15 @@ class VariationalToLighterRuntime:
         now_mono = time.monotonic()
         cooldown_remaining = self.order_cooldown_seconds - (now_mono - self._last_variational_order_ts)
         all_positions = self.runtime.monitor.positions
-        total_notional = sum(
-            abs(to_decimal(p.get("value")) or Decimal("0"))
-            for p in all_positions.values()
-        )
+        var_mid_dash, _, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
+        _var_ref = var_mid_dash or Decimal("0")
+        def _pos_notional_dash(p: dict) -> Decimal:
+            v = to_decimal(p.get("value"))
+            if v is not None:
+                return abs(v)
+            qty = abs(to_decimal(p.get("qty")) or Decimal("0"))
+            return qty * _var_ref
+        total_notional = sum(_pos_notional_dash(p) for p in all_positions.values())
 
         # Dynamic thresholds from Lighter internal spread
         def _fmt_spread(val: Decimal | None) -> str:
