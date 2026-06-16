@@ -1134,16 +1134,11 @@ class VariationalToLighterRuntime:
             long_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
             short_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
 
-            # Actual positions from exchange (source of truth)
             all_pos = self.runtime.monitor.positions
-            def _pos_notional(p: dict) -> Decimal:
-                v = to_decimal(p.get("value"))
-                if v is not None:
-                    return abs(v)
-                # value field unparseable (e.g. "$1,628.83"); estimate from qty × price
-                qty = abs(to_decimal(p.get("qty")) or Decimal("0"))
-                return qty * var_mid
-            actual_total = sum(_pos_notional(p) for p in all_pos.values())
+            # Use internal notional counters for limit enforcement — they are updated
+            # synchronously on every successful order and are not affected by monitor
+            # update latency or unparseable value field formats.
+            actual_total = self._open_long_notional + self._open_short_notional
             cur_pos = all_pos.get(self.variational_ticker, {})
             cur_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
             has_long = cur_qty > Decimal("0.000001")
