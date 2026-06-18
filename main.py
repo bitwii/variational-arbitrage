@@ -270,7 +270,7 @@ class VariationalToLighterRuntime:
         self._order_in_flight: bool = False
         # (side, monotonic_ts) entries for orders whose Lighter hedge was already placed
         # by signal_loop; trade_loop checks this to avoid double-hedging when fill event arrives.
-        self._pre_hedged: list[tuple[str, float]] = []
+        self._pre_hedged: list[tuple[str, float, str]] = []
         self.signal_task: asyncio.Task[None] | None = None
         self.bbo_task: asyncio.Task[None] | None = None
         self._bbo_log_interval = int(os.getenv("VAR_BBO_LOG_INTERVAL_SECONDS", "600"))
@@ -824,6 +824,33 @@ class VariationalToLighterRuntime:
         now_iso = utc_now()
         fill_iso = str(event.get("timestamp") or now_iso)
 
+        # Fast path: if signal_loop already pre-hedged this fill, merge the actual fill price
+        # into the existing pending record instead of creating a duplicate entry.
+        if status == "filled":
+            now_mono = time.monotonic()
+            for i, (ph_side, ph_ts, ph_key) in enumerate(self._pre_hedged):
+                if ph_side == side and now_mono - ph_ts < 180:
+                    async with self._record_lock:
+                        pending_rec = self.records.get(ph_key)
+                        if pending_rec is not None:
+                            self._pre_hedged.pop(i)
+                            pending_rec.var_fill_price = to_decimal(event.get("price"))
+                            pending_rec.var_fill_ts_iso = fill_iso
+                            if side == "buy":
+                                self._open_trade_queue.append(ph_key)
+                            elif side == "sell" and self._open_trade_queue:
+                                open_key = self._open_trade_queue.popleft()
+                                open_rec = self.records.get(open_key)
+                                if open_rec and open_rec.var_fill_price and pending_rec.var_fill_price:
+                                    pending_rec.matched_open_key = open_key
+                                    open_rec.matched_open_key = ph_key
+                            filled_payload = pending_rec.to_payload()
+                    if pending_rec is not None:
+                        await self.append_order_log("variational_fill", filled_payload)
+                        return
+                    # pending_rec not found: leave token so hedge trigger block below skips hedge.
+                    break
+
         created = False
 
         async with self._record_lock:
@@ -891,7 +918,7 @@ class VariationalToLighterRuntime:
             if need_hedge:
                 now_mono = time.monotonic()
                 already_hedged = False
-                for i, (ph_side, ph_ts) in enumerate(self._pre_hedged):
+                for i, (ph_side, ph_ts, ph_key) in enumerate(self._pre_hedged):
                     if ph_side == record.side and now_mono - ph_ts < 180:
                         self._pre_hedged.pop(i)
                         already_hedged = True
@@ -1263,14 +1290,14 @@ class VariationalToLighterRuntime:
                         if pending_key not in self.records:
                             self.records[pending_key] = pending_rec
                             self.record_order.append(pending_key)
-                    await self.append_order_log("variational_fill", pending_rec.to_payload())
                     await self.place_lighter_order(pending_rec)
                     # Only mark as pre-hedged if the Lighter order was actually placed.
                     # If it failed, trade_loop should still try when the fill event arrives.
+                    # Include pending_key so trade_loop can merge the fill event into this record.
                     if pending_rec.lighter_side is not None and pending_rec.hedge_error is None:
                         now_mono = time.monotonic()
-                        self._pre_hedged.append((side, now_mono))
-                        self._pre_hedged = [(s, t) for s, t in self._pre_hedged if now_mono - t < 180]
+                        self._pre_hedged.append((side, now_mono, pending_key))
+                        self._pre_hedged = [(s, t, k) for s, t, k in self._pre_hedged if now_mono - t < 180]
             else:
                 self._last_variational_order_ts = time.monotonic()
                 error_msg = str(result.get("error", ""))
