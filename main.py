@@ -846,7 +846,7 @@ class VariationalToLighterRuntime:
                                     open_rec.matched_open_key = ph_key
                             filled_payload = pending_rec.to_payload()
                     if pending_rec is not None:
-                        await self.append_order_log("variational_fill", filled_payload)
+                        # var_fill_price updated in-memory; signal_loop already logged variational_fill.
                         return
                     # pending_rec not found: leave token so hedge trigger block below skips hedge.
                     break
@@ -1291,6 +1291,10 @@ class VariationalToLighterRuntime:
                             self.records[pending_key] = pending_rec
                             self.record_order.append(pending_key)
                     await self.place_lighter_order(pending_rec)
+                    # Log after hedge so the entry includes lighter_side / lighter_client_order_id.
+                    # trade_loop will update var_fill_price in-memory when the fill event arrives
+                    # but will NOT write a second variational_fill log (no duplicate).
+                    await self.append_order_log("variational_fill", pending_rec.to_payload())
                     # Only mark as pre-hedged if the Lighter order was actually placed.
                     # If it failed, trade_loop should still try when the fill event arrives.
                     # Include pending_key so trade_loop can merge the fill event into this record.
