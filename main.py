@@ -61,7 +61,18 @@ LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
 CST = timezone(timedelta(hours=8))
 
 def utc_now() -> str:
-    return datetime.now(CST).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-5]
+    return datetime.now(CST).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+
+def to_cst_str(iso: str) -> str:
+    """Convert any ISO timestamp (UTC with Z, or offset-aware, or naive CST) to CST string."""
+    try:
+        iso_clean = iso.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso_clean)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=CST)
+        return dt.astimezone(CST).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    except Exception:
+        return iso
 
 
 def to_decimal(value: Any) -> Decimal | None:
@@ -822,7 +833,7 @@ class VariationalToLighterRuntime:
         trade_id = str(event.get("trade_id", "")).strip()
 
         now_iso = utc_now()
-        fill_iso = str(event.get("timestamp") or now_iso)
+        fill_iso = to_cst_str(str(event.get("timestamp"))) if event.get("timestamp") else now_iso
 
         # Fast path: if signal_loop already pre-hedged this fill, merge the actual fill price
         # into the existing pending record instead of creating a duplicate entry.
@@ -847,6 +858,7 @@ class VariationalToLighterRuntime:
                             filled_payload = pending_rec.to_payload()
                     if pending_rec is not None:
                         # var_fill_price updated in-memory; signal_loop already logged variational_fill.
+                        await self.append_order_log("var_fill_price_update", filled_payload)
                         return
                     # pending_rec not found: leave token so hedge trigger block below skips hedge.
                     break
