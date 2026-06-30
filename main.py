@@ -261,8 +261,9 @@ class VariationalToLighterRuntime:
             quiet=True,
         )
 
-        self.spread_multiplier = Decimal(os.getenv("VAR_SPREAD_MULTIPLIER", "2.0"))
-        self.close_multiplier = Decimal(os.getenv("VAR_CLOSE_MULTIPLIER", "1.0"))
+        self.spread_avg_window_seconds = float(os.getenv("VAR_SPREAD_AVG_WINDOW_SECONDS", "300"))
+        self.open_profit_margin_pct = Decimal(os.getenv("VAR_OPEN_PROFIT_MARGIN_PCT", "0.02"))
+        self.close_profit_margin_pct = Decimal(os.getenv("VAR_CLOSE_PROFIT_MARGIN_PCT", "0.0"))
         self.narrow_close_pct = Decimal(os.getenv("VAR_NARROW_CLOSE_PCT", "0.01"))
         self.narrow_close_delta = Decimal(os.getenv("VAR_NARROW_CLOSE_DELTA_PCT", "0.02"))
         self.min_open_spread_pct = Decimal(os.getenv("VAR_MIN_OPEN_SPREAD_PCT", "0"))
@@ -279,13 +280,16 @@ class VariationalToLighterRuntime:
         self._injection_fail_count: int = 0
         self._injection_fail_last_log_ts: float = 0.0
         self._order_in_flight: bool = False
-        # (side, monotonic_ts) entries for orders whose Lighter hedge was already placed
-        # by signal_loop; trade_loop checks this to avoid double-hedging when fill event arrives.
+        self._inflight_order_side: str | None = None   # side of the current in-flight Var order
+        self._inflight_fill_event: dict | None = None  # fill event buffered while in-flight
+        # (side, monotonic_ts, pending_key) — fill arrived after in-flight completed; fast-path
+        # in process_variational_trade_event uses this to merge fill price into pending_rec.
         self._pre_hedged: list[tuple[str, float, str]] = []
         self.signal_task: asyncio.Task[None] | None = None
         self.bbo_task: asyncio.Task[None] | None = None
         self._bbo_log_interval = int(os.getenv("VAR_BBO_LOG_INTERVAL_SECONDS", "600"))
         self._bbo_output_dir = output_dir
+        self._bbo_written_headers: set[str] = set()
 
         self.orders_file = output_dir / "order_metrics.jsonl" if output_dir else None
         self.trade_records_csv_file = output_dir / TRADE_RECORDS_CSV_FILE.name if output_dir else None
@@ -299,6 +303,8 @@ class VariationalToLighterRuntime:
         self._open_trade_queue: deque[str] = deque()  # FIFO queue of unmatched open keys
         self._record_lock = asyncio.Lock()
         self.cross_spread_history: deque[tuple[float, float | None, float | None]] = deque()
+        # (monotonic_ts, var_book_spread_pct, lighter_book_spread_pct) — for threshold baseline
+        self._book_spread_history: deque[tuple[float, float, float]] = deque()
         self._asset_switch_lock = asyncio.Lock()
         self._asset_switch_candidate: str | None = None
         self._asset_switch_candidate_hits = 0
@@ -514,6 +520,9 @@ class VariationalToLighterRuntime:
         try:
             client_order_id = int(client_order_id_raw)
         except Exception:
+            self.logger.warning(
+                "Lighter fill: cannot parse client_order_id=%r — order ignored", client_order_id_raw
+            )
             return
 
         fill_price: Decimal | None = None
@@ -521,6 +530,12 @@ class VariationalToLighterRuntime:
         filled_base = to_decimal(order.get("filled_base_amount"))
         if filled_quote is not None and filled_base is not None and filled_base != 0:
             fill_price = filled_quote / filled_base
+        else:
+            self.logger.warning(
+                "Lighter fill cid=%s: fill_price could not be computed "
+                "(filled_quote=%s filled_base=%s) — price recorded as null",
+                client_order_id_raw, filled_quote, filled_base,
+            )
 
         now_iso = utc_now()
 
@@ -530,6 +545,11 @@ class VariationalToLighterRuntime:
                 return
             record = self.records.get(trade_key)
             if record is None:
+                self.logger.error(
+                    "Lighter fill cid=%s maps to trade_key=%r but record is missing — "
+                    "possible data loss; fill ignored",
+                    client_order_id, trade_key,
+                )
                 return
             if record.lighter_fill_ts_iso is not None:
                 return
@@ -552,6 +572,17 @@ class VariationalToLighterRuntime:
 
             payload = record.to_payload()
 
+        if record.roundtrip_pnl is not None:
+            self.logger.info(
+                "Lighter fill confirmed: side=%s price=%s qty=%s | roundtrip_pnl=%s (var=%s lt=%s)",
+                record.lighter_side, fill_price, record.qty,
+                record.roundtrip_pnl, record.var_pnl, record.lt_pnl,
+            )
+        else:
+            self.logger.info(
+                "Lighter fill confirmed: side=%s price=%s qty=%s",
+                record.lighter_side, fill_price, record.qty,
+            )
         await self.append_order_log("lighter_fill", payload)
 
     def build_lighter_ws_url(self) -> str:
@@ -625,10 +656,18 @@ class VariationalToLighterRuntime:
                         elif msg_type == "update/order_book" and self.lighter_snapshot_loaded:
                             order_book = data.get("order_book", {})
                             if "offset" not in order_book:
+                                self.logger.debug(
+                                    "handle_lighter_ws: update/order_book 消息缺少 offset 字段，跳过"
+                                )
                                 continue
                             new_offset = int(order_book["offset"])
                             async with self.lighter_order_book_lock:
                                 if not self.validate_order_book_offset(new_offset):
+                                    self.logger.warning(
+                                        "handle_lighter_ws: 订单簿序列号跳变 "
+                                        "(expected >%s, got %s) — 将重新订阅快照",
+                                        self.lighter_order_book_offset, new_offset,
+                                    )
                                     self.lighter_order_book_sequence_gap = True
                                 else:
                                     self.update_lighter_order_book("bids", order_book.get("bids", []))
@@ -738,6 +777,10 @@ class VariationalToLighterRuntime:
 
         best_bid, best_ask = await self.get_lighter_best_bid_ask()
         if best_bid is None or best_ask is None:
+            self.logger.warning(
+                "place_lighter_order: 订单簿未就绪，无法对冲 (trade_key=%s side=%s qty=%s)",
+                record.trade_key, side, record.qty,
+            )
             async with self._record_lock:
                 record.hedge_error = "Lighter order book not ready"
                 payload = record.to_payload()
@@ -754,6 +797,10 @@ class VariationalToLighterRuntime:
 
         base_amount = int(record.qty * self.base_amount_multiplier)
         if base_amount <= 0:
+            self.logger.warning(
+                "place_lighter_order: qty=%s 转换后 base_amount=0，跳过对冲 (trade_key=%s multiplier=%s)",
+                record.qty, record.trade_key, self.base_amount_multiplier,
+            )
             async with self._record_lock:
                 record.hedge_error = f"Hedge base amount rounds to zero ({record.qty})"
                 payload = record.to_payload()
@@ -797,6 +844,10 @@ class VariationalToLighterRuntime:
                 self._lighter_actual_qty += record.qty
             else:
                 self._lighter_actual_qty -= record.qty
+            self.logger.info(
+                "Lighter hedge sent: side=%s qty=%s limit_price=%s",
+                side, record.qty, limit_price,
+            )
         except Exception as exc:
             async with self._record_lock:
                 record.lighter_side = side
@@ -820,12 +871,22 @@ class VariationalToLighterRuntime:
 
     async def process_variational_trade_event(self, event: dict[str, Any]) -> None:
         if not self.should_track_variational_event(event):
+            if normalize_variational_status(str(event.get("status", ""))) == "filled":
+                self.logger.warning(
+                    "process_variational_trade_event: filled 事件被过滤 "
+                    "(side=%s asset=%s qty=%s) — 不在跟踪范围",
+                    event.get("side"), event.get("asset"), event.get("qty"),
+                )
             return
 
         key = self.trade_key(event)
         side = str(event.get("side", "")).strip().lower()
         qty = to_decimal(event.get("qty"))
         if qty is None:
+            self.logger.warning(
+                "process_variational_trade_event: qty 无法解析 (raw=%r trade_id=%s) — 事件忽略",
+                event.get("qty"), event.get("trade_id"),
+            )
             return
 
         status = normalize_variational_status(str(event.get("status", "")))
@@ -858,10 +919,31 @@ class VariationalToLighterRuntime:
                             filled_payload = pending_rec.to_payload()
                     if pending_rec is not None:
                         # var_fill_price updated in-memory; signal_loop already logged variational_fill.
+                        self.logger.info(
+                            "Var fill confirmed: side=%s price=%s qty=%s",
+                            side, pending_rec.var_fill_price, pending_rec.qty,
+                        )
                         await self.append_order_log("var_fill_price_update", filled_payload)
                         return
-                    # pending_rec not found: leave token so hedge trigger block below skips hedge.
+                    # pending_rec not found: pre-hedged token exists but record disappeared — state inconsistency.
+                    self.logger.error(
+                        "process_variational_trade_event: pre-hedged token 匹配 (key=%s side=%s) "
+                        "但 record 已消失 — 对冲状态不一致",
+                        ph_key, side,
+                    )
                     break
+
+            # Buffer path: fill arrived while signal_loop is awaiting the Var order response.
+            # _order_in_flight is True from before the order is sent until place_lighter_order
+            # completes, so this fill is for the current in-flight order.  Hand it off to
+            # signal_loop (which will apply it to pending_rec after getting rfq_id) and return.
+            if self._order_in_flight and self._inflight_order_side == side:
+                self._inflight_fill_event = event
+                self.logger.debug(
+                    "process_variational_trade_event: fill buffered for in-flight order "
+                    "(side=%s price=%s)", side, event.get("price"),
+                )
+                return
 
         created = False
 
@@ -918,6 +1000,10 @@ class VariationalToLighterRuntime:
                 filled_payload = None
 
         if filled_payload is not None:
+            self.logger.info(
+                "Var fill confirmed: side=%s price=%s qty=%s",
+                record.side, record.var_fill_price, record.qty,
+            )
             await self.append_order_log("variational_fill", filled_payload)
 
         # Trigger hedge on fill confirmation only if signal_loop hasn't already pre-hedged it.
@@ -928,6 +1014,10 @@ class VariationalToLighterRuntime:
             async with self._record_lock:
                 need_hedge = record.lighter_side is None and record.hedge_error is None
             if need_hedge:
+                # Reach here only when the fill event arrived AFTER _order_in_flight was
+                # cleared (i.e. signal_loop has completed).  Check _pre_hedged in case
+                # signal_loop created a pending_rec but the fill event is arriving via a
+                # second delivery or a different event path.
                 now_mono = time.monotonic()
                 already_hedged = False
                 for i, (ph_side, ph_ts, ph_key) in enumerate(self._pre_hedged):
@@ -971,63 +1061,86 @@ class VariationalToLighterRuntime:
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     async def bbo_loop(self) -> None:
-        import csv as _csv
-        written_headers: set[str] = set()
-
         while not self.stop_flag:
             await asyncio.sleep(self._bbo_log_interval)
             if self.stop_flag:
                 break
 
-            var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
-            lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
-            if None in (var_bid, var_ask, lighter_bid, lighter_ask):
-                continue
+            try:
+                var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
+                lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
+                if None in (var_bid, var_ask, lighter_bid, lighter_ask):
+                    continue
 
-            lighter_int_pct = (lighter_ask - lighter_bid) / lighter_bid * 100
-            open_thr = lighter_int_pct * self.spread_multiplier
-            close_thr = lighter_int_pct * self.close_multiplier
-            long_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
-            short_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
+                if self._book_spread_history:
+                    _e = self._book_spread_history
+                    _bsl = Decimal(str(sum(v for _, v, _ in _e) / len(_e))) + Decimal(str(sum(l for _, _, l in _e) / len(_e)))
+                else:
+                    _bsl = (book_spread_percent(var_bid, var_ask) or Decimal("0")) + (book_spread_percent(lighter_bid, lighter_ask) or Decimal("0"))
+                open_thr = _bsl + self.open_profit_margin_pct
+                close_thr = _bsl + self.close_profit_margin_pct
+                long_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
+                short_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
 
-            all_pos = self.runtime.monitor.positions
-            total_notional = sum(
-                abs(to_decimal(p.get("value")) or Decimal("0"))
-                for p in all_pos.values()
-            )
+                await self._write_bbo_snapshot(
+                    var_bid, var_ask, lighter_bid, lighter_ask,
+                    long_pct, short_pct, open_thr, close_thr, event="periodic",
+                )
+            except Exception as exc:
+                self.logger.error("bbo_loop error: %s", exc, exc_info=True)
 
-            ticker = self.variational_ticker or "UNKNOWN"
-            out_dir = self._bbo_output_dir or Path("./logs")
-            out_dir.mkdir(parents=True, exist_ok=True)
-            bbo_file = out_dir / f"bbo_{ticker}_{datetime.now().strftime('%Y%m')}.csv"
+    async def _write_bbo_snapshot(
+        self,
+        var_bid: Decimal, var_ask: Decimal,
+        lighter_bid: Decimal, lighter_ask: Decimal,
+        long_pct: Decimal | None, short_pct: Decimal | None,
+        open_thr: Decimal, close_thr: Decimal,
+        event: str,
+    ) -> None:
+        import csv as _csv
 
-            row = {
-                "timestamp": utc_now(),
-                "ticker": ticker,
-                "var_bid": f"{var_bid:,.6f}",
-                "var_ask": f"{var_ask:,.6f}",
-                "var_spread_pct": f"{(var_ask - var_bid) / var_bid * 100:.6f}",
-                "lighter_bid": f"{lighter_bid:,.6f}",
-                "lighter_ask": f"{lighter_ask:,.6f}",
-                "lighter_spread_pct": f"{lighter_int_pct:.6f}",
-                "long_spread_pct": f"{long_pct:.6f}" if long_pct is not None else "",
-                "short_spread_pct": f"{short_pct:.6f}" if short_pct is not None else "",
-                "open_threshold_pct": f"{open_thr:.6f}",
-                "close_threshold_pct": f"{close_thr:.6f}",
-                "total_notional_usdc": f"{total_notional:,.6f}",
-            }
-            headers = list(row.keys())
-            needs_header = str(bbo_file) not in written_headers and not bbo_file.exists()
+        all_pos = self.runtime.monitor.positions
+        total_notional = sum(
+            abs(to_decimal(p.get("value")) or Decimal("0"))
+            for p in all_pos.values()
+        )
 
-            def _write(path: Path, needs_hdr: bool, r: dict, hdrs: list) -> None:
-                with path.open("a", newline="", encoding="utf-8") as f:
-                    w = _csv.DictWriter(f, fieldnames=hdrs)
-                    if needs_hdr:
-                        w.writeheader()
-                    w.writerow(r)
+        ticker = self.variational_ticker or "UNKNOWN"
+        out_dir = self._bbo_output_dir or Path("./logs")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        bbo_file = out_dir / f"bbo_{ticker}_{datetime.now().strftime('%Y%m')}.csv"
 
+        row = {
+            "timestamp": utc_now(),
+            "ticker": ticker,
+            "event": event,
+            "var_bid": f"{var_bid:,.6f}",
+            "var_ask": f"{var_ask:,.6f}",
+            "var_spread_pct": f"{(var_ask - var_bid) / var_bid * 100:.6f}",
+            "lighter_bid": f"{lighter_bid:,.6f}",
+            "lighter_ask": f"{lighter_ask:,.6f}",
+            "lighter_spread_pct": f"{float((lighter_ask - lighter_bid) / lighter_bid * 100):.6f}",
+            "long_spread_pct": f"{long_pct:.6f}" if long_pct is not None else "",
+            "short_spread_pct": f"{short_pct:.6f}" if short_pct is not None else "",
+            "open_threshold_pct": f"{open_thr:.6f}",
+            "close_threshold_pct": f"{close_thr:.6f}",
+            "total_notional_usdc": f"{total_notional:,.6f}",
+        }
+        headers = list(row.keys())
+        needs_header = str(bbo_file) not in self._bbo_written_headers and not bbo_file.exists()
+
+        def _write(path: Path, needs_hdr: bool, r: dict, hdrs: list) -> None:
+            with path.open("a", newline="", encoding="utf-8") as f:
+                w = _csv.DictWriter(f, fieldnames=hdrs)
+                if needs_hdr:
+                    w.writeheader()
+                w.writerow(r)
+
+        try:
             await asyncio.to_thread(_write, bbo_file, needs_header, row, headers)
-            written_headers.add(str(bbo_file))
+            self._bbo_written_headers.add(str(bbo_file))
+        except Exception as exc:
+            self.logger.error("bbo snapshot write error: %s", exc, exc_info=True)
 
     async def load_initial_positions(self) -> None:
         from lighter import ApiClient, Configuration, AccountApi
@@ -1150,12 +1263,24 @@ class VariationalToLighterRuntime:
 
             if self._order_in_flight:
                 continue
-            if time.monotonic() - self._last_variational_order_ts < self.order_cooldown_seconds:
+            _now = time.monotonic()
+            _cooldown_remaining = self.order_cooldown_seconds - (_now - self._last_variational_order_ts)
+            if _cooldown_remaining > 0:
+                if _now - getattr(self, "_cooldown_log_ts", 0) >= 60:
+                #    self.logger.info(
+                #        "signal_loop: cooldown %.0fs remaining", _cooldown_remaining,
+                #    )
+                    self._cooldown_log_ts = _now
                 continue
 
             var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
             lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
             if None in (var_bid, var_ask, lighter_bid, lighter_ask):
+                _now = time.monotonic()
+                if _now - getattr(self, "_price_none_last_log_ts", 0) >= 60:
+                    self.logger.warning(" price feed unavailable " "(var_bid=%s var_ask=%s lighter_bid=%s lighter_ask=%s) — skipping",
+                        var_bid, var_ask, lighter_bid, lighter_ask,  )
+                    self._price_none_last_log_ts = _now
                 continue
 
             # Price sanity check: skip if two exchanges diverge >VAR_MAX_PRICE_DEVIATION_PCT
@@ -1163,41 +1288,121 @@ class VariationalToLighterRuntime:
             lighter_mid = (lighter_bid + lighter_ask) / 2
             price_deviation_pct = abs(var_mid - lighter_mid) / lighter_mid * 100
             if price_deviation_pct > self.max_price_deviation_pct:
+                self.logger.warning(
+                    "signal_loop: price deviation %.2f%% exceeds limit %.2f%% "
+                    "(var_mid=%s lighter_mid=%s) — skipping",
+                    price_deviation_pct, self.max_price_deviation_pct, var_mid, lighter_mid,
+                )
                 continue
 
-            # Dynamic threshold based on Lighter internal spread
-            lighter_internal_pct = (lighter_ask - lighter_bid) / lighter_bid * 100
-            open_threshold = lighter_internal_pct * self.spread_multiplier
-            close_threshold = lighter_internal_pct * self.close_multiplier
+            # Record instantaneous book spreads for rolling average
+            _now_mono = time.monotonic()
+            _var_bsp = float(book_spread_percent(var_bid, var_ask) or 0)
+            _lit_bsp = float(book_spread_percent(lighter_bid, lighter_ask) or 0)
+            self._book_spread_history.append((_now_mono, _var_bsp, _lit_bsp))
+            _bsh_cutoff = _now_mono - self.spread_avg_window_seconds
+            while self._book_spread_history and self._book_spread_history[0][0] < _bsh_cutoff:
+                self._book_spread_history.popleft()
 
+            # Threshold = avg(var_spread) + avg(lighter_spread) over the window, plus profit margin
+            _entries = self._book_spread_history
+            if len(_entries) < 60:
+                if _now_mono - getattr(self, "_warmup_log_ts", 0) >= 30:
+                    self.logger.info("signal_loop: warmup — %d/60 samples collected, skipping", len(_entries))
+                    self._warmup_log_ts = _now_mono
+                continue
+            _avg_var = Decimal(str(sum(v for _, v, _ in _entries) / len(_entries)))
+            _avg_lit = Decimal(str(sum(l for _, _, l in _entries) / len(_entries)))
+            _spread_baseline = _avg_var + _avg_lit
+            open_threshold = _spread_baseline + self.open_profit_margin_pct
+            close_threshold = _spread_baseline + self.close_profit_margin_pct
+
+            # 计算跨所价差百分比，正值代表 Lighter 买一比 Var 卖一贵，负值代表 Var 买一比 Lighter 卖一贵
             long_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
             short_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
+            _now = time.monotonic()
+            self.logger.info(
+                    "signal_loop: long_pct=%.4f%% short_pct=%.4f%%  "
+                    "open_thr=%.4f%%(%.4fU) close_thr=%.4f%%(%.4fU) narrow_close=%.4f%%(%.4fU)",
+                    long_pct or 0, short_pct or 0,
+                    open_threshold, float(open_threshold) / 100 * float(var_ask),
+                    close_threshold, float(close_threshold) / 100 * float(var_ask),
+                    self.narrow_close_pct, float(self.narrow_close_pct) / 100 * float(var_ask),
+                )
+            # 防止价差快照log过于频繁，限制每60秒输出一次
+            if _now - getattr(self, "_spread_log_ts", 0) >= 60:
+                self.logger.info("lt_ask=%s lt_bid=%s var_ask=%s var_bid=%s", lighter_ask, lighter_bid, var_ask, var_bid)
+                self._spread_log_ts = _now
 
             all_pos = self.runtime.monitor.positions
             # Use internal notional counters for limit enforcement — they are updated
             # synchronously on every successful order and are not affected by monitor
             # update latency or unparseable value field formats.
+            # 多头和空头敞口加起来，计算总的名义价值，用于和max_total_notional_usdc比较，防止过度开仓,
             actual_total = self._open_long_notional + self._open_short_notional
+            # cur_qty是当前持仓数量，has_long和has_short是判断当前是否有多头或空头持仓
             cur_pos = all_pos.get(self.variational_ticker, {})
             cur_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
             has_long = cur_qty > Decimal("0.000001")
             has_short = cur_qty < Decimal("-0.000001")
+            # 防止log过于频繁，限制每60秒输出一次
+            if _now - getattr(self, "_pos_log_ts", 0) >= 60:
+                self.logger.info(
+                    "signal_loop: var_qty=%s lt_qty=%s total=%s/%sU  "
+                    "long_pct=%.4f%% short_pct=%.4f%% open_thr=%.4f%% close_thr=%.4f%% narrow_close=%.4f%%  ",
+                    cur_qty, self._lighter_actual_qty, actual_total, self.max_total_notional_usdc,
+                    long_pct or 0, short_pct or 0, open_threshold, close_threshold, self.narrow_close_pct
+                )
+                self._pos_log_ts = _now
 
-            # Close opportunities take priority
+            # 优先处理平仓, 有多仓而且平仓价差比大于平仓阈值，short_pct是当前空头价差百分比，要比平仓阈值close_threshold大，说明空头价差过大，触发平多条件
             if has_long and short_pct is not None and short_pct >= close_threshold:
+                self.logger.info(
+                    "signal_loop: [条件A] 反转平多 short_pct=%.4f%% >= close_thr=%.4f%% "
+                    "(long_pct=%.4f%% open_thr=%.4f%% var_bid=%s var_ask=%s lt_bid=%s lt_ask=%s qty=%s)",
+                    short_pct, close_threshold, long_pct or 0, open_threshold,
+                    var_bid, var_ask, lighter_bid, lighter_ask, cur_qty,
+                )
                 qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
+                await self._write_bbo_snapshot(
+                    var_bid, var_ask, lighter_bid, lighter_ask,
+                    long_pct, short_pct, open_threshold, close_threshold, event="close",
+                )
                 await self._trigger_variational_order("sell", qty, short_pct, is_close=True)
                 continue
+            # 有空仓，而且做多价差大于平仓阈值。
             if has_short and long_pct is not None and long_pct >= close_threshold:
+                self.logger.info(
+                    "signal_loop: [条件A] 反转平空 long_pct=%.4f%% >= close_thr=%.4f%% "
+                    "(short_pct=%.4f%% open_thr=%.4f%% var_bid=%s var_ask=%s lt_bid=%s lt_ask=%s qty=%s)",
+                    long_pct, close_threshold, short_pct or 0, open_threshold,
+                    var_bid, var_ask, lighter_bid, lighter_ask, cur_qty,
+                )
                 qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
+                await self._write_bbo_snapshot(
+                    var_bid, var_ask, lighter_bid, lighter_ask,
+                    long_pct, short_pct, open_threshold, close_threshold, event="close",
+                )
                 await self._trigger_variational_order("buy", qty, long_pct, is_close=True)
                 continue
 
+
+            #long_pct	做多价差%：(lighter_bid - var_ask) / var_ask，正值代表 Lighter 买一比 Var 卖一贵
+            #short_pct	做空价差%：(var_bid - lighter_ask) / lighter_ask，正值代表 Var 买一比 Lighter 卖一贵
+            #close_threshold	动态平仓阈值，= Lighter 内部买卖价差 × close_multiplier
+            #narrow_close_pct	收窄平仓兜底阈值（环境变量 VAR_NARROW_CLOSE_PCT，默认 0.01%）
+            #narrow_close_delta	动态收窄容忍量（VAR_NARROW_CLOSE_DELTA_PCT，默认 0.02%）
+            #open_spread_pct	开仓时实际捕获的价差%（用来算动态平仓阈值）
+            #narrow_threshold	本轮判断用的收窄阈值（动态或兜底）
+            #oldest_rec	队列里最老的未平开仓记录（FIFO）
+
             # Narrow-spread close: close when spread has narrowed by at least DELTA from opening.
-            # Falls back to absolute VAR_NARROW_CLOSE_PCT floor when no open record is available.
+            # Falls back to absolute VAR_NARROW_CLOSE_PCT floor when no open record is available.       
             if has_long and long_pct is not None:
                 narrow_threshold = self.narrow_close_pct  # fallback: +0.01% (near zero, close before losing)
+                _using_dynamic = False
                 if self._open_trade_queue:
+                    # 取队列里最老的开仓记录，计算开仓时的价差百分比，然后减去收窄容忍量，得到动态收窄阈值
                     oldest_rec = self.records.get(self._open_trade_queue[0])
                     if (oldest_rec and oldest_rec.var_fill_price
                             and oldest_rec.lighter_fill_price):
@@ -1206,12 +1411,38 @@ class VariationalToLighterRuntime:
                             / oldest_rec.var_fill_price * 100
                         )
                         narrow_threshold = open_spread_pct - self.narrow_close_delta
+                        _using_dynamic = True
+                        self.logger.info(
+                            "signal_loop: [条件B] 计算到动态收窄阈值比较long_pct=%.4f%% < thr=%.4f%% lt_fill=%.6f var_fill=%.6f  "
+                            "(open_spread=%.4f%% open_key=%s)",
+                            long_pct, narrow_threshold,
+                            oldest_rec.lighter_fill_price, oldest_rec.var_fill_price,
+                            open_spread_pct,
+                            self._open_trade_queue[0] if self._open_trade_queue else "—",
+                        )
+                    else:
+                        self.logger.debug(
+                            "signal_loop: [条件B] var_fill_price 缺失，使用兜底阈值 %.4f%%"
+                            " (key=%s)",
+                            self.narrow_close_pct,
+                            self._open_trade_queue[0] if self._open_trade_queue else "—",
+                        )
                 if long_pct < narrow_threshold:
+                    self.logger.info(
+                        "signal_loop: [条件B] 收窄平多 long_pct=%.4f%% < thr=%.4f%% (%s)",
+                        long_pct, narrow_threshold,
+                        "动态" if _using_dynamic else "兜底",
+                    )
                     qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
+                    await self._write_bbo_snapshot(
+                        var_bid, var_ask, lighter_bid, lighter_ask,
+                        long_pct, short_pct, open_threshold, close_threshold, event="close",
+                    )
                     await self._trigger_variational_order("sell", qty, long_pct, is_close=True)
                     continue
             if has_short and short_pct is not None:
                 narrow_threshold = -self.narrow_close_pct  # fallback: -0.01% (near zero, close before losing)
+                _using_dynamic = False
                 if self._open_trade_queue:
                     oldest_rec = self.records.get(self._open_trade_queue[0])
                     if (oldest_rec and oldest_rec.var_fill_price
@@ -1221,32 +1452,73 @@ class VariationalToLighterRuntime:
                             / oldest_rec.lighter_fill_price * 100
                         )
                         narrow_threshold = -(open_spread_pct - self.narrow_close_delta)
+                        _using_dynamic = True
+                    else:
+                        self.logger.debug(
+                            "signal_loop: [条件B] var_fill_price 缺失，使用兜底阈值 %.4f%%"
+                            " (key=%s)",
+                            self.narrow_close_pct,
+                            self._open_trade_queue[0] if self._open_trade_queue else "—",
+                        )
                 if short_pct > narrow_threshold:
+                    self.logger.info(
+                        "signal_loop: [条件B] 收窄平空 short_pct=%.4f%% > thr=%.4f%% (%s)",
+                        short_pct, narrow_threshold,
+                        "动态" if _using_dynamic else "兜底",
+                    )
                     qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
+                    await self._write_bbo_snapshot(
+                        var_bid, var_ask, lighter_bid, lighter_ask,
+                        long_pct, short_pct, open_threshold, close_threshold, event="close",
+                    )
                     await self._trigger_variational_order("buy", qty, short_pct, is_close=True)
                     continue
 
-            # Block opens if single-leg mismatch is detected
+            # 上面是处理完了平仓逻辑，接下来要看开仓逻辑。Block opens if single-leg mismatch is detected
             if self._single_leg_blocked:
+                _now = time.monotonic()
+                if _now - getattr(self, "_single_leg_log_ts", 0) >= 60:
+                    self.logger.warning("signal_loop: 单腿保护激活，开仓已阻止")
+                    self._single_leg_log_ts = _now
                 continue
 
             # Open new position only if total notional is within limit
             if actual_total + self.order_notional_usdc > self.max_total_notional_usdc:
+                _now = time.monotonic()
+                if _now - getattr(self, "_notional_limit_last_log_ts", 0) >= 300:
+                    self.logger.warning(
+                        "signal_loop: notional limit reached (current=%s limit=%s) — open blocked",
+                        actual_total, self.max_total_notional_usdc,
+                    )
+                    self._notional_limit_last_log_ts = _now
                 continue
 
             if long_pct is not None and long_pct >= open_threshold and long_pct >= self.min_open_spread_pct:
                 qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
+                await self._write_bbo_snapshot(
+                    var_bid, var_ask, lighter_bid, lighter_ask,
+                    long_pct, short_pct, open_threshold, close_threshold, event="open",
+                )
                 await self._trigger_variational_order("buy", qty, long_pct)
             elif short_pct is not None and short_pct >= open_threshold and short_pct >= self.min_open_spread_pct:
                 qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
+                await self._write_bbo_snapshot(
+                    var_bid, var_ask, lighter_bid, lighter_ask,
+                    long_pct, short_pct, open_threshold, close_threshold, event="open",
+                )
                 await self._trigger_variational_order("sell", qty, short_pct)
 
     async def _trigger_variational_order(
         self, side: str, qty: Decimal, trigger_pct: Decimal, is_close: bool = False
     ) -> None:
+        self.logger.info(
+            "trigger_variational_order: side=%s qty=%s spread=%.4f%% is_close=%s",
+            side, qty, trigger_pct, is_close,
+        )
         if self._order_in_flight:
             return
         self._order_in_flight = True
+        self._inflight_order_side = side
         qty_str = format(qty, "f")
         action = "CLOSE" if is_close else "OPEN"
         try:
@@ -1278,9 +1550,11 @@ class VariationalToLighterRuntime:
                     else:
                         self._open_short_notional += self.order_notional_usdc
                 rfq_id = (result.get("data") or {}).get("rfq_id", "-")
+                _buf = self._inflight_fill_event
+                _fill_price = to_decimal(_buf.get("price")) if _buf and str(_buf.get("side", "")).lower() == side else None
                 self.logger.info(
-                    "Variational order ok (%s): side=%s qty=%s spread=%.4f%% rfq_id=%s → long_exp=%sU short_exp=%sU",
-                    action, side, qty_str, trigger_pct, rfq_id,
+                    "Variational order ok (%s): side=%s qty=%s price=%s spread=%.4f%% → long_exp=%sU short_exp=%sU",
+                    action, side, qty_str, _fill_price or "pending", trigger_pct,
                     self._open_long_notional, self._open_short_notional,
                 )
                 # Place Lighter hedge immediately — Variational fill events are not
@@ -1302,20 +1576,33 @@ class VariationalToLighterRuntime:
                         if pending_key not in self.records:
                             self.records[pending_key] = pending_rec
                             self.record_order.append(pending_key)
+                        # Apply fill price buffered by process_variational_trade_event if the
+                        # fill event arrived while we were awaiting place_order_internal above.
+                        buf = self._inflight_fill_event
+                        if buf is not None and str(buf.get("side", "")).lower() == side:
+                            pending_rec.var_fill_price = to_decimal(buf.get("price"))
+                            ts_raw = buf.get("timestamp")
+                            pending_rec.var_fill_ts_iso = to_cst_str(str(ts_raw)) if ts_raw else utc_now()
+                            if side == "buy":
+                                self._open_trade_queue.append(pending_key)
+                            elif side == "sell" and self._open_trade_queue:
+                                open_key = self._open_trade_queue.popleft()
+                                open_rec = self.records.get(open_key)
+                                if open_rec:
+                                    pending_rec.matched_open_key = open_key
+                                    open_rec.matched_open_key = pending_key
+                            self._inflight_fill_event = None
+                    # Pre-hedged token — for the case where the fill event arrives AFTER
+                    # we release _order_in_flight (below); fast-path in
+                    # process_variational_trade_event will merge fill price into pending_rec.
+                    now_mono = time.monotonic()
+                    self._pre_hedged.append((side, now_mono, pending_key))
+                    self._pre_hedged = [(s, t, k) for s, t, k in self._pre_hedged if now_mono - t < 180]
                     await self.place_lighter_order(pending_rec)
-                    # Log after hedge so the entry includes lighter_side / lighter_client_order_id.
-                    # trade_loop will update var_fill_price in-memory when the fill event arrives
-                    # but will NOT write a second variational_fill log (no duplicate).
                     await self.append_order_log("variational_fill", pending_rec.to_payload())
-                    # Only mark as pre-hedged if the Lighter order was actually placed.
-                    # If it failed, trade_loop should still try when the fill event arrives.
-                    # Include pending_key so trade_loop can merge the fill event into this record.
-                    if pending_rec.lighter_side is not None and pending_rec.hedge_error is None:
-                        now_mono = time.monotonic()
-                        self._pre_hedged.append((side, now_mono, pending_key))
-                        self._pre_hedged = [(s, t, k) for s, t, k in self._pre_hedged if now_mono - t < 180]
+                    if pending_rec.hedge_error is not None:
+                        self._pre_hedged = [(s, t, k) for s, t, k in self._pre_hedged if k != pending_key]
             else:
-                self._last_variational_order_ts = time.monotonic()
                 error_msg = str(result.get("error", ""))
                 if "Injection failed" in error_msg:
                     self._injection_fail_count += 1
@@ -1337,6 +1624,8 @@ class VariationalToLighterRuntime:
             self._injection_fail_count = 0
             self.logger.error("Variational order error: %s", exc)
         finally:
+            self._inflight_fill_event = None
+            self._inflight_order_side = None
             self._order_in_flight = False
 
     @staticmethod
@@ -1545,9 +1834,13 @@ class VariationalToLighterRuntime:
             return f"[{color}]{val:.4f}%[/{color}]"
 
         if lighter_bid and lighter_ask and lighter_bid > 0 and var_ask and var_bid:
-            lighter_int_pct = (lighter_ask - lighter_bid) / lighter_bid * 100
-            open_thr = lighter_int_pct * self.spread_multiplier
-            close_thr = lighter_int_pct * self.close_multiplier
+            if self._book_spread_history:
+                _e = self._book_spread_history
+                _bsl = Decimal(str(sum(v for _, v, _ in _e) / len(_e))) + Decimal(str(sum(l for _, _, l in _e) / len(_e)))
+            else:
+                _bsl = (book_spread_percent(var_bid, var_ask) or Decimal("0")) + (book_spread_percent(lighter_bid, lighter_ask) or Decimal("0"))
+            open_thr = _bsl + self.open_profit_margin_pct
+            close_thr = _bsl + self.close_profit_margin_pct
             open_thr_abs = open_thr * var_ask / 100
             close_thr_abs = close_thr * var_ask / 100
             long_abs = lighter_bid - var_ask
@@ -1566,7 +1859,7 @@ class VariationalToLighterRuntime:
                 f"空{_fmt_spread(short_var_long_lighter_pct)}({_fmt_abs(short_abs)})"
             )
         else:
-            threshold_text = f"阈值倍数 开仓×{self.spread_multiplier} 平仓×{self.close_multiplier}"
+            threshold_text = f"开仓余量+{self.open_profit_margin_pct}% 平仓余量+{self.close_profit_margin_pct}% (等待价格数据)"
 
         # Signal state
         if self._order_in_flight:
@@ -1594,12 +1887,20 @@ class VariationalToLighterRuntime:
                 upnl_str = f"  UPnL=[{upnl_color}]{cur_upnl:+.2f}U({upnl_pct:+.3f}%)[/{upnl_color}]"
             cur_pos_text = f"{direction}{cur_val:.0f}U{upnl_str}"
 
+        lighter_qty = self._lighter_actual_qty
+        if lighter_qty > Decimal("0.001"):
+            lt_pos_text = f"空{lighter_qty:.6f}".rstrip("0").rstrip(".")
+        elif lighter_qty < Decimal("-0.001"):
+            lt_pos_text = f"多{abs(lighter_qty):.6f}".rstrip("0").rstrip(".")
+        else:
+            lt_pos_text = "flat"
+
         header = Panel(
             f"[bold]{header_title}[/bold] | [bold]{self.ticker}[/bold] | "
             f"[bold {hedge_color}]{auto_hedge_label}={hedge_text}[/] | "
             f"状态={state_text} | {utc_now()}\n"
             f"信号: {threshold_text}\n"
-            f"持仓: 总={total_notional:.0f}/{self.max_total_notional_usdc}U  当前({self.ticker})={cur_pos_text}",
+            f"持仓: Var({self.ticker})={cur_pos_text}  Lighter={lt_pos_text}  总={total_notional:.0f}/{self.max_total_notional_usdc}U",
             border_style="cyan",
         )
 
