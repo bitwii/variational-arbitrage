@@ -75,6 +75,26 @@ def to_cst_str(iso: str) -> str:
         return iso
 
 
+def quote_age_ms(ts_raw: Any) -> float | None:
+    """Milliseconds elapsed since a quote's own timestamp (epoch or ISO8601)."""
+    if ts_raw is None:
+        return None
+    try:
+        ts_num = float(ts_raw)
+        ts_sec = ts_num / 1000 if ts_num > 1e12 else ts_num
+        return (time.time() - ts_sec) * 1000
+    except (TypeError, ValueError):
+        pass
+    try:
+        s = str(ts_raw).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=CST)
+        return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() * 1000
+    except Exception:
+        return None
+
+
 def to_decimal(value: Any) -> Decimal | None:
     if value is None:
         return None
@@ -721,8 +741,11 @@ class VariationalToLighterRuntime:
                 quote = self.runtime.monitor.quotes.get(self.runtime.monitor.current_quote_asset)
 
             if quote is None:
-                return None, None, None
-            return to_decimal(quote.get("bid")), to_decimal(quote.get("ask")), str(quote.get("asset", ""))
+                return None, None, None, None
+            return (
+                to_decimal(quote.get("bid")), to_decimal(quote.get("ask")), str(quote.get("asset", "")),
+                quote_age_ms(quote.get("timestamp")),
+            )
 
     @staticmethod
     def trade_key(event: dict[str, Any]) -> str:
@@ -813,8 +836,10 @@ class VariationalToLighterRuntime:
             while client_order_id in self.lighter_client_order_to_trade_key:
                 client_order_id += 1
 
+        t_sign_start = time.monotonic()
         try:
             async with self._lighter_signer_lock:
+                t_lock_acquired = time.monotonic()
                 if not self.lighter_client:
                     self.initialize_lighter_client()
                 _, tx_hash, error = await self.lighter_client.create_order(
@@ -828,6 +853,7 @@ class VariationalToLighterRuntime:
                     reduce_only=False,
                     trigger_price=0,
                 )
+            t_signed = time.monotonic()
 
             if error is not None:
                 raise RuntimeError(f"Sign error: {error}")
@@ -848,6 +874,20 @@ class VariationalToLighterRuntime:
                 "Lighter hedge sent: side=%s qty=%s limit_price=%s",
                 side, record.qty, limit_price,
             )
+            lock_wait_ms = (t_lock_acquired - t_sign_start) * 1000
+            sign_submit_ms = (t_signed - t_lock_acquired) * 1000
+            self.logger.info(
+                "Lighter sign/submit timing: lock_wait=%.1fms sign_submit=%.1fms total=%.1fms",
+                lock_wait_ms, sign_submit_ms, lock_wait_ms + sign_submit_ms,
+            )
+            await self.append_order_log("lighter_submit_timing", {
+                "trade_key": record.trade_key,
+                "side": side,
+                "qty": str(record.qty),
+                "lock_wait_ms": round(lock_wait_ms, 1),
+                "sign_submit_ms": round(sign_submit_ms, 1),
+                "total_ms": round(lock_wait_ms + sign_submit_ms, 1),
+            })
         except Exception as exc:
             async with self._record_lock:
                 record.lighter_side = side
@@ -1067,7 +1107,7 @@ class VariationalToLighterRuntime:
                 break
 
             try:
-                var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
+                var_bid, var_ask, _, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
                 lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
                 if None in (var_bid, var_ask, lighter_bid, lighter_ask):
                     continue
@@ -1273,7 +1313,7 @@ class VariationalToLighterRuntime:
                     self._cooldown_log_ts = _now
                 continue
 
-            var_bid, var_ask, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
+            var_bid, var_ask, _, var_quote_age_ms = await self.get_variational_best_bid_ask(self.variational_ticker)
             lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
             if None in (var_bid, var_ask, lighter_bid, lighter_ask):
                 _now = time.monotonic()
@@ -1368,7 +1408,7 @@ class VariationalToLighterRuntime:
                     var_bid, var_ask, lighter_bid, lighter_ask,
                     long_pct, short_pct, open_threshold, close_threshold, event="close",
                 )
-                await self._trigger_variational_order("sell", qty, short_pct, is_close=True)
+                await self._trigger_variational_order("sell", qty, short_pct, is_close=True, quote_age_ms=var_quote_age_ms)
                 continue
             # 有空仓，而且做多价差大于平仓阈值。
             if has_short and long_pct is not None and long_pct >= close_threshold:
@@ -1383,7 +1423,7 @@ class VariationalToLighterRuntime:
                     var_bid, var_ask, lighter_bid, lighter_ask,
                     long_pct, short_pct, open_threshold, close_threshold, event="close",
                 )
-                await self._trigger_variational_order("buy", qty, long_pct, is_close=True)
+                await self._trigger_variational_order("buy", qty, long_pct, is_close=True, quote_age_ms=var_quote_age_ms)
                 continue
 
 
@@ -1438,7 +1478,7 @@ class VariationalToLighterRuntime:
                         var_bid, var_ask, lighter_bid, lighter_ask,
                         long_pct, short_pct, open_threshold, close_threshold, event="close",
                     )
-                    await self._trigger_variational_order("sell", qty, long_pct, is_close=True)
+                    await self._trigger_variational_order("sell", qty, long_pct, is_close=True, quote_age_ms=var_quote_age_ms)
                     continue
             if has_short and short_pct is not None:
                 narrow_threshold = -self.narrow_close_pct  # fallback: -0.01% (near zero, close before losing)
@@ -1471,7 +1511,7 @@ class VariationalToLighterRuntime:
                         var_bid, var_ask, lighter_bid, lighter_ask,
                         long_pct, short_pct, open_threshold, close_threshold, event="close",
                     )
-                    await self._trigger_variational_order("buy", qty, short_pct, is_close=True)
+                    await self._trigger_variational_order("buy", qty, short_pct, is_close=True, quote_age_ms=var_quote_age_ms)
                     continue
 
             # 上面是处理完了平仓逻辑，接下来要看开仓逻辑。Block opens if single-leg mismatch is detected
@@ -1499,21 +1539,23 @@ class VariationalToLighterRuntime:
                     var_bid, var_ask, lighter_bid, lighter_ask,
                     long_pct, short_pct, open_threshold, close_threshold, event="open",
                 )
-                await self._trigger_variational_order("buy", qty, long_pct)
+                await self._trigger_variational_order("buy", qty, long_pct, quote_age_ms=var_quote_age_ms)
             elif short_pct is not None and short_pct >= open_threshold and short_pct >= self.min_open_spread_pct:
                 qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
                 await self._write_bbo_snapshot(
                     var_bid, var_ask, lighter_bid, lighter_ask,
                     long_pct, short_pct, open_threshold, close_threshold, event="open",
                 )
-                await self._trigger_variational_order("sell", qty, short_pct)
+                await self._trigger_variational_order("sell", qty, short_pct, quote_age_ms=var_quote_age_ms)
 
     async def _trigger_variational_order(
-        self, side: str, qty: Decimal, trigger_pct: Decimal, is_close: bool = False
+        self, side: str, qty: Decimal, trigger_pct: Decimal, is_close: bool = False,
+        quote_age_ms: float | None = None,
     ) -> None:
         self.logger.info(
-            "trigger_variational_order: side=%s qty=%s spread=%.4f%% is_close=%s",
+            "trigger_variational_order: side=%s qty=%s spread=%.4f%% is_close=%s quote_age=%sms",
             side, qty, trigger_pct, is_close,
+            f"{quote_age_ms:.1f}" if quote_age_ms is not None else "?",
         )
         if self._order_in_flight:
             return
@@ -1557,6 +1599,22 @@ class VariationalToLighterRuntime:
                     action, side, qty_str, _fill_price or "pending", trigger_pct,
                     self._open_long_notional, self._open_short_notional,
                 )
+                self.logger.info(
+                    "Variational submit timing: lock_wait=%.1fms api_elapsed=%.1fms submit_total=%.1fms quote_age=%sms",
+                    result.get("_lock_wait_ms", 0.0), result.get("_api_elapsed_ms", 0.0),
+                    result.get("_submit_total_ms", 0.0),
+                    f"{quote_age_ms:.1f}" if quote_age_ms is not None else "?",
+                )
+                await self.append_order_log("variational_submit_timing", {
+                    "trade_id": rfq_id,
+                    "side": side,
+                    "qty": qty_str,
+                    "is_close": is_close,
+                    "quote_age_ms": quote_age_ms,
+                    "lock_wait_ms": result.get("_lock_wait_ms"),
+                    "api_elapsed_ms": result.get("_api_elapsed_ms"),
+                    "submit_total_ms": result.get("_submit_total_ms"),
+                })
                 # Place Lighter hedge immediately — Variational fill events are not
                 # reliably delivered (reduce-only closes sometimes produce no event),
                 # so we cannot wait for trade_loop to trigger the hedge.
@@ -1749,7 +1807,7 @@ class VariationalToLighterRuntime:
         return float(median(values))
 
     async def render_dashboard(self) -> Group:
-        var_bid, var_ask, quote_asset = await self.get_variational_best_bid_ask(self.variational_ticker)
+        var_bid, var_ask, quote_asset, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
         lighter_bid, lighter_ask = await self.get_lighter_best_bid_ask()
         var_book_spread = spread_value(var_bid, var_ask)
         lighter_book_spread = spread_value(lighter_bid, lighter_ask)
@@ -1816,7 +1874,7 @@ class VariationalToLighterRuntime:
         now_mono = time.monotonic()
         cooldown_remaining = self.order_cooldown_seconds - (now_mono - self._last_variational_order_ts)
         all_positions = self.runtime.monitor.positions
-        var_mid_dash, _, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
+        var_mid_dash, _, _, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
         _var_ref = var_mid_dash or Decimal("0")
         def _pos_notional_dash(p: dict) -> Decimal:
             v = to_decimal(p.get("value"))

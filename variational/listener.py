@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import base64
 import json
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -688,7 +689,9 @@ class CommandBroker:
         request_id = str(uuid.uuid4())
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
 
+        t_start = time.monotonic()
         async with self._lock:
+            t_lock_acquired = time.monotonic()
             if self._extension is None:
                 return {"ok": False, "error": "No extension connected"}
             self._pending_requests[request_id] = fut
@@ -701,13 +704,20 @@ class CommandBroker:
                 "isReduceOnly": is_reduce_only,
                 "timestamp": utc_now(),
             })
+        t_sent = time.monotonic()
 
         try:
-            return await asyncio.wait_for(fut, timeout=timeout_seconds)
+            result = await asyncio.wait_for(fut, timeout=timeout_seconds)
         except asyncio.TimeoutError:
             async with self._lock:
                 self._pending_requests.pop(request_id, None)
             return {"ok": False, "error": f"Order timed out after {timeout_seconds}s"}
+
+        t_done = time.monotonic()
+        result["_lock_wait_ms"] = round((t_lock_acquired - t_start) * 1000, 1)
+        result["_api_elapsed_ms"] = round((t_done - t_sent) * 1000, 1)
+        result["_submit_total_ms"] = round((t_done - t_start) * 1000, 1)
+        return result
 
     async def _send(self, websocket: websockets.ServerConnection, payload: dict[str, Any]) -> None:
         try:
