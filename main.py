@@ -283,6 +283,10 @@ class VariationalToLighterRuntime:
 
         self.spread_avg_window_seconds = float(os.getenv("VAR_SPREAD_AVG_WINDOW_SECONDS", "300"))
         self.open_profit_margin_pct = Decimal(os.getenv("VAR_OPEN_PROFIT_MARGIN_PCT", "0.02"))
+        # 开仓门槛随仓位利用率线性插值：空仓时门槛=margin*min_mult（放宽），
+        # 接近满仓时门槛=margin*max_mult（收紧，只留给特别好的价差）
+        self.open_margin_min_mult = Decimal(os.getenv("VAR_OPEN_MARGIN_MIN_MULT", "0.5"))
+        self.open_margin_max_mult = Decimal(os.getenv("VAR_OPEN_MARGIN_MAX_MULT", "3.0"))
         self.close_profit_margin_pct = Decimal(os.getenv("VAR_CLOSE_PROFIT_MARGIN_PCT", "0.0"))
         self.narrow_close_pct = Decimal(os.getenv("VAR_NARROW_CLOSE_PCT", "0.01"))
         self.narrow_close_delta = Decimal(os.getenv("VAR_NARROW_CLOSE_DELTA_PCT", "0.02"))
@@ -1385,13 +1389,23 @@ class VariationalToLighterRuntime:
             cur_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
             has_long = cur_qty > Decimal("0.000001")
             has_short = cur_qty < Decimal("-0.000001")
+
+            # 仓位利用率越高，开仓门槛越严：空仓时按min_mult放宽，接近满仓时按max_mult收紧，
+            # 只把剩下的一点配额留给特别好的机会
+            _utilization = min(max(actual_total / self.max_total_notional_usdc, Decimal("0")), Decimal("1"))
+            _margin_mult = self.open_margin_min_mult + (self.open_margin_max_mult - self.open_margin_min_mult) * _utilization
+            scaled_open_threshold = _spread_baseline + self.open_profit_margin_pct * _margin_mult
+
             # 防止log过于频繁，限制每60秒输出一次
             if _now - getattr(self, "_pos_log_ts", 0) >= 60:
                 self.logger.info(
-                    "signal_loop: var_qty=%s lt_qty=%s total=%s/%sU  "
-                    "long_pct=%.4f%% short_pct=%.4f%% open_thr=%.4f%% close_thr=%.4f%% narrow_close=%.4f%%  ",
+                    "signal_loop: var_qty=%s lt_qty=%s total=%s/%sU util=%.1f%% margin_mult=%.2f  "
+                    "long_pct=%.4f%% short_pct=%.4f%% open_thr_base=%.4f%% open_thr_scaled=%.4f%% "
+                    "close_thr=%.4f%% narrow_close=%.4f%%  ",
                     cur_qty, self._lighter_actual_qty, actual_total, self.max_total_notional_usdc,
-                    long_pct or 0, short_pct or 0, open_threshold, close_threshold, self.narrow_close_pct
+                    _utilization * 100, _margin_mult,
+                    long_pct or 0, short_pct or 0, open_threshold, scaled_open_threshold,
+                    close_threshold, self.narrow_close_pct
                 )
                 self._pos_log_ts = _now
 
@@ -1442,30 +1456,31 @@ class VariationalToLighterRuntime:
                 narrow_threshold = self.narrow_close_pct  # fallback: +0.01% (near zero, close before losing)
                 _using_dynamic = False
                 if self._open_trade_queue:
-                    # 取队列里最老的开仓记录，计算开仓时的价差百分比，然后减去收窄容忍量，得到动态收窄阈值
-                    oldest_rec = self.records.get(self._open_trade_queue[0])
-                    if (oldest_rec and oldest_rec.var_fill_price
-                            and oldest_rec.lighter_fill_price):
-                        open_spread_pct = (
-                            (oldest_rec.lighter_fill_price - oldest_rec.var_fill_price)
-                            / oldest_rec.var_fill_price * 100
-                        )
+                    # 账户里同方向持仓是一个整体仓位，分不出哪笔成交对应哪一份——
+                    # 用队列里所有未平记录按qty加权平均开仓价差，而不是只看最老一笔，
+                    # 避免某一笔开在价差异常宽/窄时刻的记录单独把阈值带偏、卡住整条队列。
+                    total_qty = Decimal("0")
+                    weighted_spread = Decimal("0")
+                    for key in self._open_trade_queue:
+                        rec = self.records.get(key)
+                        if rec and rec.var_fill_price and rec.lighter_fill_price:
+                            spread = (rec.lighter_fill_price - rec.var_fill_price) / rec.var_fill_price * 100
+                            weighted_spread += spread * rec.qty
+                            total_qty += rec.qty
+                    if total_qty > 0:
+                        open_spread_pct = weighted_spread / total_qty
                         narrow_threshold = open_spread_pct - self.narrow_close_delta
                         _using_dynamic = True
                         self.logger.info(
-                            "signal_loop: [条件B] 计算到动态收窄阈值比较long_pct=%.4f%% < thr=%.4f%% lt_fill=%.6f var_fill=%.6f  "
-                            "(open_spread=%.4f%% open_key=%s)",
-                            long_pct, narrow_threshold,
-                            oldest_rec.lighter_fill_price, oldest_rec.var_fill_price,
-                            open_spread_pct,
-                            self._open_trade_queue[0] if self._open_trade_queue else "—",
+                            "signal_loop: [条件B] 持仓均价动态收窄阈值 long_pct=%.4f%% < thr=%.4f%% "
+                            "(avg_open_spread=%.4f%% n=%d total_qty=%s)",
+                            long_pct, narrow_threshold, open_spread_pct,
+                            len(self._open_trade_queue), total_qty,
                         )
                     else:
                         self.logger.debug(
-                            "signal_loop: [条件B] var_fill_price 缺失，使用兜底阈值 %.4f%%"
-                            " (key=%s)",
+                            "signal_loop: [条件B] var_fill_price 缺失，使用兜底阈值 %.4f%%",
                             self.narrow_close_pct,
-                            self._open_trade_queue[0] if self._open_trade_queue else "—",
                         )
                 if long_pct < narrow_threshold:
                     self.logger.info(
@@ -1484,21 +1499,29 @@ class VariationalToLighterRuntime:
                 narrow_threshold = -self.narrow_close_pct  # fallback: -0.01% (near zero, close before losing)
                 _using_dynamic = False
                 if self._open_trade_queue:
-                    oldest_rec = self.records.get(self._open_trade_queue[0])
-                    if (oldest_rec and oldest_rec.var_fill_price
-                            and oldest_rec.lighter_fill_price):
-                        open_spread_pct = (
-                            (oldest_rec.var_fill_price - oldest_rec.lighter_fill_price)
-                            / oldest_rec.lighter_fill_price * 100
-                        )
+                    # 同上：按qty加权平均所有未平仓记录的开仓价差，而不是只看最老一笔
+                    total_qty = Decimal("0")
+                    weighted_spread = Decimal("0")
+                    for key in self._open_trade_queue:
+                        rec = self.records.get(key)
+                        if rec and rec.var_fill_price and rec.lighter_fill_price:
+                            spread = (rec.var_fill_price - rec.lighter_fill_price) / rec.lighter_fill_price * 100
+                            weighted_spread += spread * rec.qty
+                            total_qty += rec.qty
+                    if total_qty > 0:
+                        open_spread_pct = weighted_spread / total_qty
                         narrow_threshold = -(open_spread_pct - self.narrow_close_delta)
                         _using_dynamic = True
+                        self.logger.info(
+                            "signal_loop: [条件B] 持仓均价动态收窄阈值 short_pct=%.4f%% > thr=%.4f%% "
+                            "(avg_open_spread=%.4f%% n=%d total_qty=%s)",
+                            short_pct, narrow_threshold, open_spread_pct,
+                            len(self._open_trade_queue), total_qty,
+                        )
                     else:
                         self.logger.debug(
-                            "signal_loop: [条件B] var_fill_price 缺失，使用兜底阈值 %.4f%%"
-                            " (key=%s)",
+                            "signal_loop: [条件B] var_fill_price 缺失，使用兜底阈值 %.4f%%",
                             self.narrow_close_pct,
-                            self._open_trade_queue[0] if self._open_trade_queue else "—",
                         )
                 if short_pct > narrow_threshold:
                     self.logger.info(
@@ -1533,18 +1556,18 @@ class VariationalToLighterRuntime:
                     self._notional_limit_last_log_ts = _now
                 continue
 
-            if long_pct is not None and long_pct >= open_threshold and long_pct >= self.min_open_spread_pct:
+            if long_pct is not None and long_pct >= scaled_open_threshold and long_pct >= self.min_open_spread_pct:
                 qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
                 await self._write_bbo_snapshot(
                     var_bid, var_ask, lighter_bid, lighter_ask,
-                    long_pct, short_pct, open_threshold, close_threshold, event="open",
+                    long_pct, short_pct, scaled_open_threshold, close_threshold, event="open",
                 )
                 await self._trigger_variational_order("buy", qty, long_pct, quote_age_ms=var_quote_age_ms)
-            elif short_pct is not None and short_pct >= open_threshold and short_pct >= self.min_open_spread_pct:
+            elif short_pct is not None and short_pct >= scaled_open_threshold and short_pct >= self.min_open_spread_pct:
                 qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
                 await self._write_bbo_snapshot(
                     var_bid, var_ask, lighter_bid, lighter_ask,
-                    long_pct, short_pct, open_threshold, close_threshold, event="open",
+                    long_pct, short_pct, scaled_open_threshold, close_threshold, event="open",
                 )
                 await self._trigger_variational_order("sell", qty, short_pct, quote_age_ms=var_quote_age_ms)
 
