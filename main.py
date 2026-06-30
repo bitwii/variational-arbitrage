@@ -1152,7 +1152,7 @@ class VariationalToLighterRuntime:
         ticker = self.variational_ticker or "UNKNOWN"
         out_dir = self._bbo_output_dir or Path("./logs")
         out_dir.mkdir(parents=True, exist_ok=True)
-        bbo_file = out_dir / f"bbo_{ticker}_{datetime.now().strftime('%Y%m')}.csv"
+        bbo_file = out_dir / f"bbo_{ticker}_{datetime.now(CST).strftime('%Y%m')}.csv"
 
         row = {
             "timestamp": utc_now(),
@@ -1714,7 +1714,10 @@ class VariationalToLighterRuntime:
         if not iso:
             return "-"
         try:
-            dt = datetime.fromisoformat(iso).astimezone(CST)
+            dt = datetime.fromisoformat(iso)
+            # Naive strings from utc_now()/to_cst_str() are already CST wall-clock time —
+            # tag them as CST directly instead of letting astimezone() assume system-local tz.
+            dt = dt.replace(tzinfo=CST) if dt.tzinfo is None else dt.astimezone(CST)
             ms = dt.strftime("%f")[:2]
             return dt.strftime(f"%y%m%d,%H:%M:%S.{ms}")
         except Exception:
