@@ -306,6 +306,7 @@ class VariationalToLighterRuntime:
         self._order_in_flight: bool = False
         self._inflight_order_side: str | None = None   # side of the current in-flight Var order
         self._inflight_fill_event: dict | None = None  # fill event buffered while in-flight
+        self._last_var_fill_seen_mono: float = 0.0     # monotonic time of last confirmed var fill event
         # (side, monotonic_ts, pending_key) — fill arrived after in-flight completed; fast-path
         # in process_variational_trade_event uses this to merge fill price into pending_rec.
         self._pre_hedged: list[tuple[str, float, str]] = []
@@ -989,6 +990,22 @@ class VariationalToLighterRuntime:
                 )
                 return
 
+            # Filled event reached Python but matched neither pre_hedged nor in-flight buffer.
+            # This is unusual — log details to help diagnose timing or side-mismatch issues.
+            _now_mono2 = time.monotonic()
+            _ph_summary = [
+                f"(side={s} age={_now_mono2-t:.1f}s key={k[:8]})"
+                for s, t, k in self._pre_hedged
+            ]
+            self.logger.warning(
+                "process_variational_trade_event: filled 事件无匹配 pre_hedged token "
+                "(side=%s price=%s trade_id=%s) — "
+                "order_in_flight=%s inflight_side=%s pre_hedged=%s",
+                side, event.get("price"), trade_id[:8] if trade_id else "?",
+                self._order_in_flight, self._inflight_order_side,
+                _ph_summary if _ph_summary else "[]",
+            )
+
         created = False
 
         async with self._record_lock:
@@ -1099,9 +1116,34 @@ class VariationalToLighterRuntime:
                 self._asset_switch_candidate_hits = 0
 
             events = await self.runtime.monitor.get_trade_events_since(self.trade_event_cursor, limit=500)
+            _now_mono = time.monotonic()
             for event in events:
                 self.trade_event_cursor = max(self.trade_event_cursor, int(event.get("event_seq", 0) or 0))
+                _ev_status = str(event.get("status", "")).strip().lower()
+                if _ev_status == "filled":
+                    self._last_var_fill_seen_mono = _now_mono
                 await self.process_variational_trade_event(event)
+
+            # Periodic health: log monitor's event-seq progress and fill-event staleness
+            if _now_mono - getattr(self, "_trade_loop_health_ts", 0) >= 60:
+                latest_seq = await self.runtime.monitor.get_latest_trade_event_seq()
+                fill_age = _now_mono - self._last_var_fill_seen_mono if self._last_var_fill_seen_mono else None
+                has_pos = (self._open_long_notional + self._open_short_notional) > 0
+                self.logger.info(
+                    "trade_loop health: cursor=%d monitor_seq=%d fill_age=%s has_pos=%s",
+                    self.trade_event_cursor,
+                    latest_seq,
+                    f"{fill_age:.0f}s" if fill_age is not None else "never",
+                    has_pos,
+                )
+                if fill_age is not None and fill_age > 300 and has_pos:
+                    self.logger.warning(
+                        "trade_loop: VAR fill events stale for %.0fs while holding positions "
+                        "(cursor=%d monitor_seq=%d) — Chrome扩展fill事件可能中断",
+                        fill_age, self.trade_event_cursor, latest_seq,
+                    )
+                self._trade_loop_health_ts = _now_mono
+
             await asyncio.sleep(POLL_INTERVAL_SECONDS)
 
     async def bbo_loop(self) -> None:
@@ -1555,7 +1597,7 @@ class VariationalToLighterRuntime:
                     )
                     self._notional_limit_last_log_ts = _now
                 continue
-
+            # 这里判断梯度开仓条件，long_pct和short_pct是当前的价差百分比，scaled_open_threshold是动态开仓阈值，self.min_open_spread_pct是最小开仓价差百分比
             if long_pct is not None and long_pct >= scaled_open_threshold and long_pct >= self.min_open_spread_pct:
                 qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
                 await self._write_bbo_snapshot(

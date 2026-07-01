@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import base64
 import json
+import logging as _logging
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -15,6 +16,8 @@ from typing import Any
 from urllib.parse import urlparse
 
 import websockets
+
+_monitor_log = _logging.getLogger("variational.monitor")
 
 
 QUOTES_INDICATIVE_PATH = "/api/quotes/indicative"
@@ -115,7 +118,9 @@ class VariationalMonitor:
             lines: list[str] = []
             now_ts = asyncio.get_running_loop().time()
             if stream == WS_EVENTS_PATH:
-                for event in self._iter_event_messages(parsed):
+                _msgs = self._iter_event_messages(parsed)
+                _filled_count = 0
+                for event in _msgs:
                     self._update_heartbeat(event, now_ts)
                     trade_line = self._update_trade_event(event)
                     if trade_line:
@@ -124,6 +129,15 @@ class VariationalMonitor:
                         if portfolio_line:
                             lines.append(f"{portfolio_line} trigger=trade")
                             self._last_portfolio_log_ts = now_ts
+                    _d = event.get("data") if isinstance(event.get("data"), dict) else event
+                    if str(_d.get("status", "")).strip().lower() == "filled":
+                        _filled_count += 1
+                # Log frames that contain fill events so we can track WS delivery
+                if _filled_count:
+                    _monitor_log.info(
+                        "[VAR_WS_FRAME] events_path frame: %d msgs, %d filled",
+                        len(_msgs), _filled_count,
+                    )
             elif stream == WS_PORTFOLIO_PATH:
                 self._update_portfolio(parsed)
 
@@ -200,6 +214,24 @@ class VariationalMonitor:
         if not isinstance(payload, dict):
             return None
         event_type = str(payload.get("type", "")).strip().lower()
+
+        # Diagnose fill-event loss: log ANY event that carries status=filled,
+        # even if the type check below would normally drop it.
+        _d = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        _status = str(_d.get("status", "")).strip().lower() if isinstance(_d, dict) else ""
+        if _status == "filled":
+            _tid = str(_d.get("id", "")) if isinstance(_d, dict) else ""
+            _monitor_log.info(
+                "[VAR_WS_FILL] status=filled type=%r trade_id=%s side=%s price=%s qty=%s"
+                " — arrived in monitor (event_seq=%d)",
+                event_type,
+                _tid[:8] if _tid else "?",
+                _d.get("side", "?") if isinstance(_d, dict) else "?",
+                _d.get("price", "?") if isinstance(_d, dict) else "?",
+                _d.get("qty", "?") if isinstance(_d, dict) else "?",
+                self._next_trade_event_seq,
+            )
+
         if "trade" not in event_type:
             return None
 
