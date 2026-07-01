@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 
 import websockets
 
-_monitor_log = _logging.getLogger("variational.monitor")
+_monitor_log = _logging.getLogger("var_lighter_runtime")
 
 
 QUOTES_INDICATIVE_PATH = "/api/quotes/indicative"
@@ -130,12 +130,12 @@ class VariationalMonitor:
                             lines.append(f"{portfolio_line} trigger=trade")
                             self._last_portfolio_log_ts = now_ts
                     _d = event.get("data") if isinstance(event.get("data"), dict) else event
-                    if str(_d.get("status", "")).strip().lower() == "filled":
+                    if str(_d.get("status", "")).strip().lower() in ("filled", "confirmed"):
                         _filled_count += 1
                 # Log frames that contain fill events so we can track WS delivery
                 if _filled_count:
                     _monitor_log.info(
-                        "[VAR_WS_FRAME] events_path frame: %d msgs, %d filled",
+                        "[VAR_WS_FRAME] events_path frame: %d msgs, %d fill-status",
                         len(_msgs), _filled_count,
                     )
             elif stream == WS_PORTFOLIO_PATH:
@@ -215,15 +215,16 @@ class VariationalMonitor:
             return None
         event_type = str(payload.get("type", "")).strip().lower()
 
-        # Diagnose fill-event loss: log ANY event that carries status=filled,
-        # even if the type check below would normally drop it.
+        # Diagnose fill-event loss: log ANY event that carries a fill status
+        # (filled OR confirmed), even if the type check below would normally drop it.
         _d = payload.get("data") if isinstance(payload.get("data"), dict) else payload
-        _status = str(_d.get("status", "")).strip().lower() if isinstance(_d, dict) else ""
-        if _status == "filled":
+        _status_raw = str(_d.get("status", "")).strip().lower() if isinstance(_d, dict) else ""
+        if _status_raw in ("filled", "confirmed"):
             _tid = str(_d.get("id", "")) if isinstance(_d, dict) else ""
             _monitor_log.info(
-                "[VAR_WS_FILL] status=filled type=%r trade_id=%s side=%s price=%s qty=%s"
+                "[VAR_WS_FILL] status=%s type=%r trade_id=%s side=%s price=%s qty=%s"
                 " — arrived in monitor (event_seq=%d)",
+                _status_raw,
                 event_type,
                 _tid[:8] if _tid else "?",
                 _d.get("side", "?") if isinstance(_d, dict) else "?",

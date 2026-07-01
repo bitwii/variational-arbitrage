@@ -1119,8 +1119,7 @@ class VariationalToLighterRuntime:
             _now_mono = time.monotonic()
             for event in events:
                 self.trade_event_cursor = max(self.trade_event_cursor, int(event.get("event_seq", 0) or 0))
-                _ev_status = str(event.get("status", "")).strip().lower()
-                if _ev_status == "filled":
+                if normalize_variational_status(str(event.get("status", ""))) == "filled":
                     self._last_var_fill_seen_mono = _now_mono
                 await self.process_variational_trade_event(event)
 
