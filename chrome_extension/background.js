@@ -107,7 +107,11 @@ const PAGE_INJECTION_SCRIPT = `
           })
         }).then(function (acceptRes) {
           return acceptRes.json().then(function (data) {
-            return JSON.stringify({ ok: acceptRes.ok, status: acceptRes.status, data: data });
+            if (acceptRes.ok) {
+              return JSON.stringify({ ok: true, data: data });
+            }
+            var reason = data.message || data.error || data.detail || JSON.stringify(data).slice(0, 150);
+            return JSON.stringify({ ok: false, error: 'accept HTTP ' + acceptRes.status + ': ' + reason });
           });
         });
       });

@@ -1726,13 +1726,13 @@ class VariationalToLighterRuntime:
                         self._pre_hedged = [(s, t, k) for s, t, k in self._pre_hedged if k != pending_key]
             else:
                 error_msg = str(result.get("error", ""))
-                if "Injection failed" in error_msg:
+                if "Injection failed" in error_msg or "accept HTTP" in error_msg:
                     self._injection_fail_count += 1
                     since_last = time.monotonic() - self._injection_fail_last_log_ts
                     if self._injection_fail_count == 1 or since_last >= 600:
                         self.logger.warning(
-                            "Variational injection failing (%s): side=%s spread=%.4f%% [attempt #%d]",
-                            action, side, trigger_pct, self._injection_fail_count,
+                            "Variational injection failing (%s): side=%s spread=%.4f%% [attempt #%d] error=%r",
+                            action, side, trigger_pct, self._injection_fail_count, error_msg,
                         )
                         self._injection_fail_last_log_ts = time.monotonic()
                 else:
