@@ -1095,7 +1095,8 @@ class VariationalToLighterRuntime:
                         break
                 if not already_hedged:
                     await self.place_lighter_order(record)
-
+    # 主循环，轮询 Variational 事件流，处理交易事件，并根据策略进行资产切换和对冲操作。
+    # 被调用在 `run()` 方法中，作为异步任务运行。
     async def trade_loop(self) -> None:
         while not self.stop_flag:
             current_asset = await self.detect_current_variational_asset()
@@ -1312,7 +1313,7 @@ class VariationalToLighterRuntime:
         except Exception as exc:
             self.logger.warning("Lighter position sync failed: %s", exc)
             return None
-    # 异步循环，用于定期同步 Lighter 交易所的持仓数量，并与 Variational 交易所的持仓数量进行比较，检测单腿
+    # 异步循环，用于定期同步 Lighter 交易所的持仓数量，并与 Variational 交易所的持仓数量进行比较，检测方向单腿
     async def lighter_sync_loop(self) -> None:
         while not self.stop_flag:
             await asyncio.sleep(self._lighter_sync_interval)
@@ -1461,17 +1462,17 @@ class VariationalToLighterRuntime:
             long_pct = spread_percent(spread_value(var_ask, lighter_bid), var_ask)
             short_pct = spread_percent(spread_value(lighter_ask, var_bid), lighter_ask)
             _now = time.monotonic()
-            self.logger.info(
-                    "signal_loop: long_pct=%.4f%% short_pct=%.4f%%  "
+            # self.logger.info(
+            #        "signal_loop: long_pct=%.4f%% short_pct=%.4f%%  "
                     "open_thr=%.4f%%(%.4fU) close_thr=%.4f%%(%.4fU) narrow_close=%.4f%%(%.4fU)",
-                    long_pct or 0, short_pct or 0,
-                    open_threshold, float(open_threshold) / 100 * float(var_ask),
-                    close_threshold, float(close_threshold) / 100 * float(var_ask),
-                    self.narrow_close_pct, float(self.narrow_close_pct) / 100 * float(var_ask),
-                )
+            #        long_pct or 0, short_pct or 0,
+            #        open_threshold, float(open_threshold) / 100 * float(var_ask),
+            #        close_threshold, float(close_threshold) / 100 * float(var_ask),
+            #        self.narrow_close_pct, float(self.narrow_close_pct) / 100 * float(var_ask),
+            #    )
             # 防止价差快照log过于频繁，限制每60秒输出一次
             if _now - getattr(self, "_spread_log_ts", 0) >= 60:
-                self.logger.info("lt_ask=%s lt_bid=%s var_ask=%s var_bid=%s", lighter_ask, lighter_bid, var_ask, var_bid)
+            #    self.logger.info("lt_ask=%s lt_bid=%s var_ask=%s var_bid=%s", lighter_ask, lighter_bid, var_ask, var_bid)
                 self._spread_log_ts = _now
 
             all_pos = self.runtime.monitor.positions
@@ -1583,12 +1584,12 @@ class VariationalToLighterRuntime:
                         open_spread_pct = weighted_spread / total_qty
                         narrow_threshold = open_spread_pct - self.narrow_close_delta
                         _using_dynamic = True
-                        self.logger.info(
-                            "signal_loop: [条件B] 持仓均价动态收窄阈值 long_pct=%.4f%% < thr=%.4f%% "
-                            "(avg_open_spread=%.4f%% n=%d total_qty=%s)",
-                            long_pct, narrow_threshold, open_spread_pct,
-                            len(self._open_trade_queue), total_qty,
-                        )
+                    #    self.logger.info(
+                    #        "signal_loop: [条件B] 持仓均价动态收窄阈值 long_pct=%.4f%% < thr=%.4f%% "
+                    #        "(avg_open_spread=%.4f%% n=%d total_qty=%s)",
+                    #        long_pct, narrow_threshold, open_spread_pct,
+                    #        len(self._open_trade_queue), total_qty,
+                    #    )
                     else:
                         self.logger.debug(
                             "signal_loop: [条件B] var_fill_price 缺失，使用兜底阈值 %.4f%%",
