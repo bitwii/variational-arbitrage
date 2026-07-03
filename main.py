@@ -1464,7 +1464,7 @@ class VariationalToLighterRuntime:
             _now = time.monotonic()
             # self.logger.info(
             #        "signal_loop: long_pct=%.4f%% short_pct=%.4f%%  "
-                    "open_thr=%.4f%%(%.4fU) close_thr=%.4f%%(%.4fU) narrow_close=%.4f%%(%.4fU)",
+            #        "open_thr=%.4f%%(%.4fU) close_thr=%.4f%%(%.4fU) narrow_close=%.4f%%(%.4fU)",
             #        long_pct or 0, short_pct or 0,
             #        open_threshold, float(open_threshold) / 100 * float(var_ask),
             #        close_threshold, float(close_threshold) / 100 * float(var_ask),
