@@ -1131,18 +1131,22 @@ class VariationalToLighterRuntime:
                 latest_seq = await self.runtime.monitor.get_latest_trade_event_seq()
                 fill_age = _now_mono - self._last_var_fill_seen_mono if self._last_var_fill_seen_mono else None
                 has_pos = (self._open_long_notional + self._open_short_notional) > 0
+                _hb_age = (await self.runtime.monitor.get_trading_state()).get("heartbeat_age")
+                _ws_dead = _hb_age is None or _hb_age > 11
                 self.logger.info(
-                    "trade_loop health: cursor=%d monitor_seq=%d fill_age=%s has_pos=%s",
+                    "trade_loop health: cursor=%d monitor_seq=%d fill_age=%s has_pos=%s hb_age=%s",
                     self.trade_event_cursor,
                     latest_seq,
                     f"{fill_age:.0f}s" if fill_age is not None else "never",
                     has_pos,
+                    f"{_hb_age:.0f}s" if _hb_age is not None else "none",
                 )
-                if fill_age is not None and fill_age > 300 and has_pos:
+                if fill_age is not None and fill_age > 300 and has_pos and _ws_dead:
                     self.logger.warning(
                         "trade_loop: VAR fill events stale for %.0fs while holding positions "
-                        "(cursor=%d monitor_seq=%d) — Chrome扩展fill事件可能中断",
+                        "(cursor=%d monitor_seq=%d hb_age=%s) — /events WS 可能已断连",
                         fill_age, self.trade_event_cursor, latest_seq,
+                        f"{_hb_age:.0f}s" if _hb_age is not None else "none",
                     )
                 self._trade_loop_health_ts = _now_mono
 
