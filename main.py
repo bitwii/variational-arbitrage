@@ -1322,7 +1322,17 @@ class VariationalToLighterRuntime:
 
             trading_state = await self.runtime.monitor.get_trading_state()
             portfolio_age = trading_state.get("portfolio_age")
+            heartbeat_age = trading_state.get("heartbeat_age")
             _PORTFOLIO_STALE_SECONDS = 300
+            if heartbeat_age is not None and heartbeat_age > 11:
+                _now_mono = time.monotonic()
+                if _now_mono - getattr(self, "_hb_stale_log_ts", 0) >= 600:
+                    self.logger.warning(
+                        "lighter_sync_loop: /events WS heartbeat stale (%.0fs) — "
+                        "fill events and portfolio updates may be lost",
+                        heartbeat_age,
+                    )
+                    self._hb_stale_log_ts = _now_mono
             if portfolio_age is not None and portfolio_age > _PORTFOLIO_STALE_SECONDS:
                 self.logger.warning(
                     "lighter_sync_loop: portfolio data stale (%.0fs) — skipping var_qty check, "
@@ -1777,6 +1787,15 @@ class VariationalToLighterRuntime:
                     # process_variational_trade_event will merge fill price into pending_rec.
                     now_mono = time.monotonic()
                     self._pre_hedged.append((side, now_mono, pending_key))
+                    for _s, _t, _k in self._pre_hedged:
+                        if now_mono - _t >= 180:
+                            _r = self.records.get(_k)
+                            if _r is not None and _r.var_fill_price is None:
+                                self.logger.warning(
+                                    "var_fill_price still None after 180s: key=%s side=%s — "
+                                    "/events WS fill event never arrived",
+                                    _k, _s,
+                                )
                     self._pre_hedged = [(s, t, k) for s, t, k in self._pre_hedged if now_mono - t < 180]
                     await self.place_lighter_order(pending_rec)
                     await self.append_order_log("variational_fill", pending_rec.to_payload())
