@@ -291,6 +291,7 @@ class VariationalToLighterRuntime:
         self.narrow_close_pct = Decimal(os.getenv("VAR_NARROW_CLOSE_PCT", "0.01"))
         self.narrow_close_delta = Decimal(os.getenv("VAR_NARROW_CLOSE_DELTA_PCT", "0.02"))
         self.min_open_spread_pct = Decimal(os.getenv("VAR_MIN_OPEN_SPREAD_PCT", "0"))
+        self.open_confirm_ticks = int(os.getenv("VAR_OPEN_CONFIRM_TICKS", "2"))
         self.max_price_deviation_pct = Decimal(os.getenv("VAR_MAX_PRICE_DEVIATION_PCT", "10"))
         self.order_notional_usdc = Decimal(os.getenv("VAR_ORDER_NOTIONAL_USDC", "300"))
         self.order_cooldown_seconds = float(os.getenv("VAR_ORDER_COOLDOWN_SECONDS", "120"))
@@ -300,6 +301,8 @@ class VariationalToLighterRuntime:
         self._lighter_actual_qty: Decimal = Decimal("0")  # signed qty synced from Lighter REST (negative=short)
         self._lighter_sync_interval: float = float(os.getenv("VAR_LIGHTER_SYNC_INTERVAL_SECONDS", "60"))
         self._single_leg_blocked: bool = False
+        self._open_confirm_count: int = 0
+        self._open_confirm_dir: str = ""  # "long" | "short"
         self._last_variational_order_ts: float = 0.0
         self._injection_fail_count: int = 0
         self._injection_fail_last_log_ts: float = 0.0
@@ -1316,6 +1319,18 @@ class VariationalToLighterRuntime:
 
             cur_pos = self.runtime.monitor.positions.get(self.variational_ticker or "", {})
             var_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
+
+            trading_state = await self.runtime.monitor.get_trading_state()
+            portfolio_age = trading_state.get("portfolio_age")
+            _PORTFOLIO_STALE_SECONDS = 300
+            if portfolio_age is not None and portfolio_age > _PORTFOLIO_STALE_SECONDS:
+                self.logger.warning(
+                    "lighter_sync_loop: portfolio data stale (%.0fs) — skipping var_qty check, "
+                    "var_qty=%s may be outdated",
+                    portfolio_age, var_qty,
+                )
+                continue
+
             var_long = var_qty > Decimal("0.001")
             var_short = var_qty < Decimal("-0.001")
             # Lighter API convention: positive qty = SHORT position, negative qty = LONG position
@@ -1428,8 +1443,24 @@ class VariationalToLighterRuntime:
             # cur_qty是当前持仓数量，has_long和has_short是判断当前是否有多头或空头持仓
             cur_pos = all_pos.get(self.variational_ticker, {})
             cur_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
-            has_long = cur_qty > Decimal("0.000001")
-            has_short = cur_qty < Decimal("-0.000001")
+            _portfolio_state = await self.runtime.monitor.get_trading_state()
+            _portfolio_age = _portfolio_state.get("portfolio_age")
+            _PORTFOLIO_STALE_SEC = 300
+            if _portfolio_age is not None and _portfolio_age > _PORTFOLIO_STALE_SEC:
+                # Portfolio WS stale: fall back to notional counters to avoid ghost closes
+                # from stale cur_qty. If notional counters say flat, we are flat.
+                has_long = self._open_long_notional > Decimal("0")
+                has_short = self._open_short_notional > Decimal("0")
+                if _now_mono - getattr(self, "_portfolio_stale_log_ts", 0) >= 60:
+                    self.logger.warning(
+                        "signal_loop: portfolio stale (%.0fs) — has_long/has_short from notional "
+                        "counters (long=%s short=%s) instead of cur_qty=%s",
+                        _portfolio_age, has_long, has_short, cur_qty,
+                    )
+                    self._portfolio_stale_log_ts = _now_mono
+            else:
+                has_long = cur_qty > Decimal("0.000001")
+                has_short = cur_qty < Decimal("-0.000001")
 
             # 仓位利用率越高，开仓门槛越严：空仓时按min_mult放宽，接近满仓时按max_mult收紧，
             # 只把剩下的一点配额留给特别好的机会
@@ -1596,21 +1627,48 @@ class VariationalToLighterRuntime:
                     )
                     self._notional_limit_last_log_ts = _now
                 continue
-            # 这里判断梯度开仓条件，long_pct和short_pct是当前的价差百分比，scaled_open_threshold是动态开仓阈值，self.min_open_spread_pct是最小开仓价差百分比
+            # 开仓条件：需要连续 VAR_OPEN_CONFIRM_TICKS 个 tick 都满足才触发，过滤单tick噪音spike
             if long_pct is not None and long_pct >= scaled_open_threshold and long_pct >= self.min_open_spread_pct:
-                qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
-                await self._write_bbo_snapshot(
-                    var_bid, var_ask, lighter_bid, lighter_ask,
-                    long_pct, short_pct, scaled_open_threshold, close_threshold, event="open",
-                )
-                await self._trigger_variational_order("buy", qty, long_pct, quote_age_ms=var_quote_age_ms)
+                if self._open_confirm_dir != "long":
+                    self._open_confirm_count = 0
+                    self._open_confirm_dir = "long"
+                self._open_confirm_count += 1
+                if self._open_confirm_count < self.open_confirm_ticks:
+                    self.logger.info(
+                        "signal_loop: 开仓确认中 %d/%d (long_pct=%.4f%% thr=%.4f%%)",
+                        self._open_confirm_count, self.open_confirm_ticks, long_pct, scaled_open_threshold,
+                    )
+                else:
+                    self._open_confirm_count = 0
+                    self._open_confirm_dir = ""
+                    qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
+                    await self._write_bbo_snapshot(
+                        var_bid, var_ask, lighter_bid, lighter_ask,
+                        long_pct, short_pct, scaled_open_threshold, close_threshold, event="open",
+                    )
+                    await self._trigger_variational_order("buy", qty, long_pct, quote_age_ms=var_quote_age_ms)
             elif short_pct is not None and short_pct >= scaled_open_threshold and short_pct >= self.min_open_spread_pct:
-                qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
-                await self._write_bbo_snapshot(
-                    var_bid, var_ask, lighter_bid, lighter_ask,
-                    long_pct, short_pct, scaled_open_threshold, close_threshold, event="open",
-                )
-                await self._trigger_variational_order("sell", qty, short_pct, quote_age_ms=var_quote_age_ms)
+                if self._open_confirm_dir != "short":
+                    self._open_confirm_count = 0
+                    self._open_confirm_dir = "short"
+                self._open_confirm_count += 1
+                if self._open_confirm_count < self.open_confirm_ticks:
+                    self.logger.info(
+                        "signal_loop: 开仓确认中 %d/%d (short_pct=%.4f%% thr=%.4f%%)",
+                        self._open_confirm_count, self.open_confirm_ticks, short_pct, scaled_open_threshold,
+                    )
+                else:
+                    self._open_confirm_count = 0
+                    self._open_confirm_dir = ""
+                    qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
+                    await self._write_bbo_snapshot(
+                        var_bid, var_ask, lighter_bid, lighter_ask,
+                        long_pct, short_pct, scaled_open_threshold, close_threshold, event="open",
+                    )
+                    await self._trigger_variational_order("sell", qty, short_pct, quote_age_ms=var_quote_age_ms)
+            else:
+                self._open_confirm_count = 0
+                self._open_confirm_dir = ""
 
     async def _trigger_variational_order(
         self, side: str, qty: Decimal, trigger_pct: Decimal, is_close: bool = False,
@@ -1976,8 +2034,9 @@ class VariationalToLighterRuntime:
                 return f"[{color}]{val:+.2f}[/{color}]"
 
             min_floor_text = f"  绝对门槛≥[bold]{self.min_open_spread_pct:.4f}%[/bold]" if self.min_open_spread_pct > 0 else ""
+            confirm_text = f"  确认{self._open_confirm_count}/{self.open_confirm_ticks}t" if self._open_confirm_count > 0 else ""
             threshold_text = (
-                f"开仓阈值≥[bold]{open_thr:.4f}%[/bold]({open_thr_abs:.2f}U){min_floor_text}  "
+                f"开仓阈值≥[bold]{open_thr:.4f}%[/bold]({open_thr_abs:.2f}U){min_floor_text}{confirm_text}  "
                 f"平仓阈值≥[bold]{close_thr:.4f}%[/bold]({close_thr_abs:.2f}U)  "
                 f"收窄平仓<[bold]{self.narrow_close_pct:.2f}%[/bold]  │  "
                 f"当前价差 多{_fmt_spread(long_var_short_lighter_pct)}({_fmt_abs(long_abs)}) "

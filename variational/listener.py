@@ -63,6 +63,7 @@ class VariationalMonitor:
     _last_quote_log_ts: float | None = None
     _last_portfolio_log_ts: float | None = None
     _last_heartbeat_monotonic: float | None = None
+    _last_portfolio_update_monotonic: float | None = None
     _next_heartbeat_check_ts: float = 0.0
     _stale_alert_sent: bool = False
     _last_hourly_alert_hour: int = 0
@@ -139,7 +140,7 @@ class VariationalMonitor:
                         len(_msgs), _filled_count,
                     )
             elif stream == WS_PORTFOLIO_PATH:
-                self._update_portfolio(parsed)
+                self._update_portfolio(parsed, now_ts)
 
             if not lines and stream != WS_PORTFOLIO_PATH:
                 return []
@@ -274,7 +275,7 @@ class VariationalMonitor:
             f"@{summary['price']} status={summary['status']} role={summary['role']} id={trade_id_short}"
         )
 
-    def _update_portfolio(self, payload: Any) -> None:
+    def _update_portfolio(self, payload: Any, now_ts: float) -> None:
         if not isinstance(payload, dict):
             return
 
@@ -316,6 +317,7 @@ class VariationalMonitor:
                 }
 
         self.positions = next_positions
+        self._last_portfolio_update_monotonic = now_ts
         self.portfolio_summary = {
             "balance": pool.get("balance") if isinstance(pool, dict) else None,
             "upnl": pool.get("upnl") if isinstance(pool, dict) else None,
@@ -427,6 +429,9 @@ class VariationalMonitor:
             heartbeat_age: float | None = None
             if self._last_heartbeat_monotonic is not None:
                 heartbeat_age = max(0.0, now_ts - self._last_heartbeat_monotonic)
+            portfolio_age: float | None = None
+            if self._last_portfolio_update_monotonic is not None:
+                portfolio_age = max(0.0, now_ts - self._last_portfolio_update_monotonic)
 
             asset = self.current_quote_asset
             quote = self.quotes.get(asset) if asset else None
@@ -447,6 +452,7 @@ class VariationalMonitor:
                 "last_update_at": self.last_update_at,
                 "last_heartbeat_iso": self.last_heartbeat_iso,
                 "heartbeat_age": heartbeat_age,
+                "portfolio_age": portfolio_age,
             }
 
     async def get_trade_events_since(
