@@ -1308,13 +1308,15 @@ class VariationalToLighterRuntime:
         except Exception as exc:
             self.logger.warning("Lighter position sync failed: %s", exc)
             return None
-
+    # 异步循环，用于定期同步 Lighter 交易所的持仓数量，并与 Variational 交易所的持仓数量进行比较，检测单腿
     async def lighter_sync_loop(self) -> None:
         while not self.stop_flag:
             await asyncio.sleep(self._lighter_sync_interval)
             lighter_qty = await self._fetch_lighter_position_qty()
             if lighter_qty is None:
+                self.logger.info("lighter_sync_loop: 无法获取 Lighter 持仓数量，跳过本次同步")
                 continue
+            #lighter约定，qty>0为空头，qty<0为多头
             self._lighter_actual_qty = lighter_qty
 
             cur_pos = self.runtime.monitor.positions.get(self.variational_ticker or "", {})
@@ -1352,17 +1354,41 @@ class VariationalToLighterRuntime:
                 or (var_short and not lt_long)
                 or (not var_long and not var_short and abs(lighter_qty) > Decimal("0.001"))
             )
+            # Two-leg imbalance: both sides have positions in matching directions but
+            # quantities differ significantly — indicates partial fill or hedge failure.
+            # Only evaluated when single_leg is False (both legs present) and var_qty is
+            # non-trivial (avoids division-by-zero on dust positions).
+            _IMBALANCE_WARN_PCT = Decimal("10")
+            both_positioned = (var_long and lt_short) or (var_short and lt_long)
+            imbalance_pct: Decimal | None = None
+            if not single_leg and both_positioned and abs(var_qty) > Decimal("0.001"):
+                imbalance_pct = (
+                    abs(abs(var_qty) - abs(lighter_qty)) / abs(var_qty) * 100
+                )
+
             if single_leg:
                 self._single_leg_blocked = True
                 self.logger.warning(
                     "SINGLE-LEG DETECTED: var_qty=%s lighter_qty=%s — new opens blocked",
                     var_qty, lighter_qty,
                 )
+            elif imbalance_pct is not None and imbalance_pct > _IMBALANCE_WARN_PCT:
+                self._single_leg_blocked = True
+                self.logger.warning(
+                    "IMBALANCE DETECTED: var_qty=%s lighter_qty=%s diff=%.1f%% > %.0f%% "
+                    "— new opens blocked",
+                    var_qty, lighter_qty, imbalance_pct, _IMBALANCE_WARN_PCT,
+                )
             else:
                 if self._single_leg_blocked:
+                    reason = (
+                        f"diff={imbalance_pct:.1f}%" if imbalance_pct is not None
+                        else "both flat"
+                    )
                     self.logger.info(
-                        "Single-leg cleared: var_qty=%s lighter_qty=%s — opens unblocked",
-                        var_qty, lighter_qty,
+                        "Single-leg/imbalance cleared: var_qty=%s lighter_qty=%s %s "
+                        "— opens unblocked",
+                        var_qty, lighter_qty, reason,
                     )
                 self._single_leg_blocked = False
 
