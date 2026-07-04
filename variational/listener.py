@@ -274,7 +274,7 @@ class VariationalMonitor:
             f"[MONITOR] TRADE {summary['side']} {summary['qty']} {summary['asset']} "
             f"@{summary['price']} status={summary['status']} role={summary['role']} id={trade_id_short}"
         )
-
+    # 解析/portfolio WS消息,存每个资产的qty/均价、upnl/rpnl等信息,并存储portfolio_summary
     def _update_portfolio(self, payload: Any, now_ts: float) -> None:
         if not isinstance(payload, dict):
             return
@@ -335,7 +335,7 @@ class VariationalMonitor:
         if self._last_portfolio_log_ts is None:
             return True
         return now_ts - self._last_portfolio_log_ts >= PORTFOLIO_LOG_INTERVAL_SECONDS
-
+    # /events WS消息里的type=heartbeat消息,更新心跳时间戳和last_heartbeat_iso,并重置stale_alert_sent和last_hourly_alert_hour
     def _update_heartbeat(self, payload: Any, now_ts: float) -> None:
         if not isinstance(payload, dict):
             return
@@ -484,7 +484,7 @@ class EventSink:
         self._write_lock = asyncio.Lock()
         if self.output_dir is not None:
             self.output_dir.mkdir(parents=True, exist_ok=True)
-
+    # 按照channel分流，在内部做CDP帧的解析和监控处理，最后写入文件
     async def handle(self, channel: str, raw_message: str) -> None:
         parsed: dict[str, Any] | str
         try:
@@ -883,7 +883,7 @@ async def run_command_server(
 
     return await websockets.serve(handler, host, port, max_size=None, ping_interval=20, ping_timeout=20)
 
-
+# 以下为测试代码，日常运行不会跑到
 async def run(config: ListenerConfig) -> None:
     monitor = VariationalMonitor(trade_limit=config.trade_limit, snapshot_file=config.snapshot_file) if config.monitor else None
     sink = EventSink(config.output_dir, quiet=config.quiet, monitor=monitor)

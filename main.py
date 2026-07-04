@@ -258,7 +258,7 @@ class VariationalRuntime:
         self.ws_server = None
         self.rest_server = None
         self.command_server = None
-
+    # 创建了三个WebSocket服务器实例，分别用于接收Variational的WebSocket事件、REST API请求和命令请求。每个服务器都绑定到指定的主机和端口，并使用EventSink和CommandBroker处理事件和命令。
     async def start(self) -> None:
         self.ws_server = await run_receiver_server("ws", self.host, self.ws_port, self.sink)
         self.rest_server = await run_receiver_server("rest", self.host, self.rest_port, self.sink)
@@ -1748,6 +1748,10 @@ class VariationalToLighterRuntime:
                         self._open_confirm_count, self.open_confirm_ticks, long_pct, scaled_open_threshold,
                     )
                 else:
+                    self.logger.info(
+                        "signal_loop: 开仓确认中 %d/%d (long_pct=%.4f%% thr=%.4f%%) — 达标，触发开仓",
+                        self._open_confirm_count, self.open_confirm_ticks, long_pct, scaled_open_threshold,
+                    )
                     self._open_confirm_count = 0
                     self._open_confirm_dir = ""
                     qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
@@ -1767,6 +1771,10 @@ class VariationalToLighterRuntime:
                         self._open_confirm_count, self.open_confirm_ticks, short_pct, scaled_open_threshold,
                     )
                 else:
+                    self.logger.info(
+                        "signal_loop: 开仓确认中 %d/%d (short_pct=%.4f%% thr=%.4f%%) — 达标，触发开仓",
+                        self._open_confirm_count, self.open_confirm_ticks, short_pct, scaled_open_threshold,
+                    )
                     self._open_confirm_count = 0
                     self._open_confirm_dir = ""
                     qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
