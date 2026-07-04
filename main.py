@@ -1791,12 +1791,14 @@ class VariationalToLighterRuntime:
                     else:
                         self._open_short_notional += self.order_notional_usdc
                 rfq_id = (result.get("data") or {}).get("rfq_id", "-")
-                # /api/quotes/accept 是 RFQ accept，接受报价的动作本身就是成交，响应体大概率
-                # 已经同步带着成交价——不需要等 /events WS 异步推送。
+                # /api/quotes/accept 的响应体经生产验证只有 rfq_id/take_profit_rfq_id/
+                # stop_loss_rfq_id，不带成交价——accept 只确认订单被接受，真正成交价仍然只能
+                # 靠 /events WS 异步推送。这里保留探测逻辑以防 Variational 未来改动 API 补上该
+                # 字段，但降级为 debug 避免每笔订单都打一条已知结果的日志。
                 _accept_data = result.get("data") or {}
                 accept_price = extract_accept_price(_accept_data)
                 if accept_price is None:
-                    self.logger.info(
+                    self.logger.debug(
                         "Var accept response has no recognized price field — raw data=%s",
                         _accept_data,
                     )
