@@ -930,6 +930,37 @@ class VariationalToLighterRuntime:
                 payload = record.to_payload()
             await self.append_order_log("lighter_error", payload)
 
+    async def _auto_correct_single_leg(self, var_qty: Decimal, lighter_qty: Decimal) -> None:
+        # Lighter convention: positive qty = SHORT, negative = LONG. A correctly hedged
+        # position has lighter_qty == var_qty (Var long X ↔ Lighter short X, same sign).
+        # delta is how much Lighter needs to move to get back to that: positive → open more
+        # short (SELL), negative → cover short / open long (BUY). Covers both single_leg
+        # (one side flat) and imbalance (both positioned, sizes drifted apart) callers.
+        delta = var_qty - lighter_qty
+        if abs(delta) < Decimal("0.000001"):
+            return
+        corr_side = "buy" if delta > 0 else "sell"  # fed into place_lighter_order's side flip
+        corr_qty = abs(delta).quantize(Decimal("0.000001"))
+        corr_key = f"autocorr:{int(time.monotonic() * 1000)}"
+        corr_rec = OrderLifecycle(
+            trade_key=corr_key,
+            trade_id=corr_key,
+            side=corr_side,
+            qty=corr_qty,
+            asset=self.variational_ticker or "UNKNOWN",
+            auto_hedge_enabled=True,
+            last_variational_status="single_leg_correction",
+        )
+        async with self._record_lock:
+            self.records[corr_key] = corr_rec
+            self.record_order.append(corr_key)
+        self.logger.warning(
+            "SINGLE-LEG AUTO-CORRECT: var_qty=%s lighter_qty=%s → Lighter %s qty=%s to rebalance",
+            var_qty, lighter_qty, "SELL" if corr_side == "buy" else "BUY", corr_qty,
+        )
+        await self.place_lighter_order(corr_rec)
+        await self.append_order_log("single_leg_auto_correct", corr_rec.to_payload())
+
     def should_track_variational_event(self, event: dict[str, Any]) -> bool:
         side = str(event.get("side", "")).strip().lower()
         if side not in {"buy", "sell"}:
@@ -1409,16 +1440,18 @@ class VariationalToLighterRuntime:
             if single_leg:
                 self._single_leg_blocked = True
                 self.logger.warning(
-                    "SINGLE-LEG DETECTED: var_qty=%s lighter_qty=%s — new opens blocked",
+                    "SINGLE-LEG DETECTED: var_qty=%s lighter_qty=%s — new opens blocked, auto-correcting",
                     var_qty, lighter_qty,
                 )
+                await self._auto_correct_single_leg(var_qty, lighter_qty)
             elif imbalance_pct is not None and imbalance_pct > _IMBALANCE_WARN_PCT:
                 self._single_leg_blocked = True
                 self.logger.warning(
                     "IMBALANCE DETECTED: var_qty=%s lighter_qty=%s diff=%.1f%% > %.0f%% "
-                    "— new opens blocked",
+                    "— new opens blocked, auto-correcting",
                     var_qty, lighter_qty, imbalance_pct, _IMBALANCE_WARN_PCT,
                 )
+                await self._auto_correct_single_leg(var_qty, lighter_qty)
             else:
                 if self._single_leg_blocked:
                     reason = (
@@ -1761,6 +1794,9 @@ class VariationalToLighterRuntime:
         self._inflight_order_side = side
         qty_str = format(qty, "f")
         action = "CLOSE" if is_close else "OPEN"
+        pending_key: str | None = None
+        pending_rec: OrderLifecycle | None = None
+        lighter_task: asyncio.Task | None = None
         try:
             # Suppress "Signal triggered" noise while injection is consistently failing
             if self._injection_fail_count == 0:
@@ -1769,6 +1805,30 @@ class VariationalToLighterRuntime:
                     action, side, qty_str, trigger_pct,
                     self._open_long_notional, self._open_short_notional,
                 )
+            if self.args.auto_hedge:
+                # Build the record and fire the Lighter hedge *before* awaiting the Variational
+                # result — don't make the hedge wait on Var's full round trip (~100-300ms) when
+                # Var's success rate is high. trade_key must be decided now (not derived from
+                # rfq_id) because place_lighter_order may register it in
+                # lighter_client_order_to_trade_key before we even know if Var succeeded.
+                # If Var ends up failing while this hedge fires successfully, the result is a
+                # single-leg exposure that lighter_sync_loop detects and auto-corrects (see
+                # _auto_correct_single_leg) within one VAR_LIGHTER_SYNC_INTERVAL_SECONDS cycle.
+                pending_key = f"rfq:{int(time.monotonic() * 1000)}"
+                pending_rec = OrderLifecycle(
+                    trade_key=pending_key,
+                    trade_id=pending_key,
+                    side=side,
+                    qty=qty,
+                    asset=self.variational_ticker or "ETH",
+                    auto_hedge_enabled=True,
+                    last_variational_status="pending",
+                )
+                async with self._record_lock:
+                    self.records[pending_key] = pending_rec
+                    self.record_order.append(pending_key)
+                lighter_task = asyncio.create_task(self.place_lighter_order(pending_rec))
+
             # 这里调用 Variational 的内部下单接口，传入方向、数量、滑点等参数
             result = await self.runtime.broker.place_order_internal(
                 side=side,
@@ -1776,6 +1836,9 @@ class VariationalToLighterRuntime:
                 max_slippage=0.01,
                 is_reduce_only=is_close,
             )
+            if lighter_task is not None:
+                await lighter_task
+
             if result.get("ok"):
                 self._last_variational_order_ts = time.monotonic()
                 self._injection_fail_count = 0
@@ -1828,20 +1891,9 @@ class VariationalToLighterRuntime:
                     "api_elapsed_ms": result.get("_api_elapsed_ms"),
                     "submit_total_ms": result.get("_submit_total_ms"),
                 })
-                # Place Lighter hedge immediately — Variational fill events are not
-                # reliably delivered (reduce-only closes sometimes produce no event),
-                # so we cannot wait for trade_loop to trigger the hedge.
-                if self.args.auto_hedge:
-                    pending_key = rfq_id[:8] if rfq_id and rfq_id != "-" else f"rfq:{int(time.monotonic()*1000)}"
-                    pending_rec = OrderLifecycle(
-                        trade_key=pending_key,
-                        trade_id=rfq_id if rfq_id != "-" else pending_key,
-                        side=side,
-                        qty=qty,
-                        asset=self.variational_ticker or "ETH",
-                        auto_hedge_enabled=True,
-                        last_variational_status="filled",
-                    )
+                if pending_rec is not None:
+                    pending_rec.trade_id = rfq_id if rfq_id != "-" else pending_key
+                    pending_rec.last_variational_status = "filled"
                     pending_rec.var_fill_ts_iso = utc_now()
                     if accept_price is not None:
                         # Earliest possible price: the accept response IS the execution,
@@ -1850,9 +1902,6 @@ class VariationalToLighterRuntime:
                         pending_rec.var_fill_price = accept_price
                         pending_rec.var_fill_source = "accept_response"
                     async with self._record_lock:
-                        if pending_key not in self.records:
-                            self.records[pending_key] = pending_rec
-                            self.record_order.append(pending_key)
                         # /events WS fill event, if it already arrived while we were awaiting
                         # place_order_internal above, is the authoritative venue confirmation —
                         # overrides the accept-response price in case the two ever disagree.
@@ -1892,12 +1941,25 @@ class VariationalToLighterRuntime:
                                     _k, _s,
                                 )
                     self._pre_hedged = [(s, t, k) for s, t, k in self._pre_hedged if now_mono - t < 180]
-                    await self.place_lighter_order(pending_rec)
                     await self.append_order_log("variational_fill", pending_rec.to_payload())
                     if pending_rec.hedge_error is not None:
                         self._pre_hedged = [(s, t, k) for s, t, k in self._pre_hedged if k != pending_key]
             else:
                 error_msg = str(result.get("error", ""))
+                if pending_rec is not None:
+                    # Variational failed but the Lighter hedge fired concurrently above may
+                    # already have gone through — that leaves a single-leg exposure. Don't
+                    # retry the hedge here; lighter_sync_loop compares real venue quantities
+                    # every sync cycle and auto-corrects (_auto_correct_single_leg).
+                    pending_rec.last_variational_status = "var_failed"
+                    if pending_rec.hedge_error is None and pending_rec.lighter_side is not None:
+                        self.logger.warning(
+                            "Var order failed AFTER Lighter hedge already filled (side=%s qty=%s "
+                            "lighter_price=%s) — single-leg exposure created; lighter_sync_loop "
+                            "will auto-correct within %.0fs",
+                            side, qty_str, pending_rec.lighter_fill_price, self._lighter_sync_interval,
+                        )
+                    await self.append_order_log("variational_order_failed_after_hedge", pending_rec.to_payload())
                 if "Injection failed" in error_msg or "accept HTTP" in error_msg:
                     self._injection_fail_count += 1
                     since_last = time.monotonic() - self._injection_fail_last_log_ts
