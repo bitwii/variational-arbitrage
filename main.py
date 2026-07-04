@@ -110,6 +110,30 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     return f"{value:,.6f}"
 
 
+# Variational's /api/quotes/accept is an RFQ-accept — the trade executes atomically at
+# accept time, so its HTTP response likely already carries the fill price synchronously.
+# Schema isn't documented anywhere, so we probe a handful of plausible key names (flat and
+# nested under a "trade"/"fill"/"order" sub-object) rather than assume one.
+_ACCEPT_PRICE_KEYS = ("price", "avg_price", "fill_price", "filled_price", "execution_price", "executed_price")
+
+
+def extract_accept_price(data: dict[str, Any]) -> Decimal | None:
+    if not isinstance(data, dict):
+        return None
+    for key in _ACCEPT_PRICE_KEYS:
+        price = to_decimal(data.get(key))
+        if price is not None and price > 0:
+            return price
+    for nest_key in ("trade", "fill", "order", "rfq"):
+        nested = data.get(nest_key)
+        if isinstance(nested, dict):
+            for key in _ACCEPT_PRICE_KEYS:
+                price = to_decimal(nested.get(key))
+                if price is not None and price > 0:
+                    return price
+    return None
+
+
 def resolve_variational_ticker(ticker: str) -> str:
     return VARIATIONAL_TICKER_OVERRIDES.get(ticker.upper(), ticker.upper())
 
@@ -179,6 +203,8 @@ class OrderLifecycle:
 
     var_fill_price: Decimal | None = None
     var_fill_ts_iso: str | None = None
+    var_fill_source: str | None = None    # "accept_response" / "events_ws" — where the price came from
+    queue_matched: bool = False           # whether _open_trade_queue append/pop already ran for this record
 
     lighter_side: str | None = None
     lighter_client_order_id: int | None = None
@@ -201,6 +227,7 @@ class OrderLifecycle:
             "asset": self.asset,
             "variational_filled_price": decimal_to_str(self.var_fill_price),
             "variational_filled_at": self.var_fill_ts_iso,
+            "variational_fill_source": self.var_fill_source,
             "lighter_order_side": self.lighter_side,
             "lighter_client_order_id": self.lighter_client_order_id,
             "lighter_filled_price": decimal_to_str(self.lighter_fill_price),
@@ -954,16 +981,24 @@ class VariationalToLighterRuntime:
                         pending_rec = self.records.get(ph_key)
                         if pending_rec is not None:
                             self._pre_hedged.pop(i)
+                            # /events WS is the authoritative venue confirmation — overrides
+                            # whatever accept_response price _trigger_variational_order set.
                             pending_rec.var_fill_price = to_decimal(event.get("price"))
                             pending_rec.var_fill_ts_iso = fill_iso
-                            if side == "buy":
-                                self._open_trade_queue.append(ph_key)
-                            elif side == "sell" and self._open_trade_queue:
-                                open_key = self._open_trade_queue.popleft()
-                                open_rec = self.records.get(open_key)
-                                if open_rec and open_rec.var_fill_price and pending_rec.var_fill_price:
-                                    pending_rec.matched_open_key = open_key
-                                    open_rec.matched_open_key = ph_key
+                            pending_rec.var_fill_source = "events_ws"
+                            # Queue bookkeeping already ran synchronously in
+                            # _trigger_variational_order for the common case (accept response
+                            # carried a price) — only run it here if that never happened.
+                            if not pending_rec.queue_matched:
+                                pending_rec.queue_matched = True
+                                if side == "buy":
+                                    self._open_trade_queue.append(ph_key)
+                                elif side == "sell" and self._open_trade_queue:
+                                    open_key = self._open_trade_queue.popleft()
+                                    open_rec = self.records.get(open_key)
+                                    if open_rec and open_rec.var_fill_price and pending_rec.var_fill_price:
+                                        pending_rec.matched_open_key = open_key
+                                        open_rec.matched_open_key = ph_key
                             filled_payload = pending_rec.to_payload()
                     if pending_rec is not None:
                         # var_fill_price updated in-memory; signal_loop already logged variational_fill.
@@ -1720,7 +1755,7 @@ class VariationalToLighterRuntime:
             side, qty, trigger_pct, is_close,
             f"{quote_age_ms:.1f}" if quote_age_ms is not None else "?",
         )
-        if self._order_in_flight:
+        if self._order_in_flight:  # 检查一下，如果下单在途，就不再重复下单，避免重复触发
             return
         self._order_in_flight = True
         self._inflight_order_side = side
@@ -1734,6 +1769,7 @@ class VariationalToLighterRuntime:
                     action, side, qty_str, trigger_pct,
                     self._open_long_notional, self._open_short_notional,
                 )
+            # 这里调用 Variational 的内部下单接口，传入方向、数量、滑点等参数
             result = await self.runtime.broker.place_order_internal(
                 side=side,
                 amount=qty_str,
@@ -1755,8 +1791,20 @@ class VariationalToLighterRuntime:
                     else:
                         self._open_short_notional += self.order_notional_usdc
                 rfq_id = (result.get("data") or {}).get("rfq_id", "-")
+                # /api/quotes/accept 是 RFQ accept，接受报价的动作本身就是成交，响应体大概率
+                # 已经同步带着成交价——不需要等 /events WS 异步推送。
+                _accept_data = result.get("data") or {}
+                accept_price = extract_accept_price(_accept_data)
+                if accept_price is None:
+                    self.logger.info(
+                        "Var accept response has no recognized price field — raw data=%s",
+                        _accept_data,
+                    )
+                # 查一眼 _inflight_fill_event buffer，如果在等 API 响应期间 fill 事件已经先到了（路径C存下的），直接把价格填进去
                 _buf = self._inflight_fill_event
-                _fill_price = to_decimal(_buf.get("price")) if _buf and str(_buf.get("side", "")).lower() == side else None
+                _fill_price = accept_price or (
+                    to_decimal(_buf.get("price")) if _buf and str(_buf.get("side", "")).lower() == side else None
+                )
                 self.logger.info(
                     "Variational order ok (%s): side=%s qty=%s price=%s spread=%.4f%% → long_exp=%sU short_exp=%sU",
                     action, side, qty_str, _fill_price or "pending", trigger_pct,
@@ -1793,17 +1841,32 @@ class VariationalToLighterRuntime:
                         last_variational_status="filled",
                     )
                     pending_rec.var_fill_ts_iso = utc_now()
+                    if accept_price is not None:
+                        # Earliest possible price: the accept response IS the execution,
+                        # arrives synchronously with order success. No need to wait for the
+                        # /events WS fill push, which the buffer below may still override.
+                        pending_rec.var_fill_price = accept_price
+                        pending_rec.var_fill_source = "accept_response"
                     async with self._record_lock:
                         if pending_key not in self.records:
                             self.records[pending_key] = pending_rec
                             self.record_order.append(pending_key)
-                        # Apply fill price buffered by process_variational_trade_event if the
-                        # fill event arrived while we were awaiting place_order_internal above.
+                        # /events WS fill event, if it already arrived while we were awaiting
+                        # place_order_internal above, is the authoritative venue confirmation —
+                        # overrides the accept-response price in case the two ever disagree.
                         buf = self._inflight_fill_event
                         if buf is not None and str(buf.get("side", "")).lower() == side:
                             pending_rec.var_fill_price = to_decimal(buf.get("price"))
+                            pending_rec.var_fill_source = "events_ws"
                             ts_raw = buf.get("timestamp")
                             pending_rec.var_fill_ts_iso = to_cst_str(str(ts_raw)) if ts_raw else utc_now()
+                            self._inflight_fill_event = None
+                        # FIFO open/close queue bookkeeping runs exactly once per record,
+                        # regardless of which source above supplied the price — guarded by
+                        # queue_matched so the later /events WS fast-path (process_variational_
+                        # trade_event) doesn't double-append/pop once this has already run.
+                        if pending_rec.var_fill_price is not None and not pending_rec.queue_matched:
+                            pending_rec.queue_matched = True
                             if side == "buy":
                                 self._open_trade_queue.append(pending_key)
                             elif side == "sell" and self._open_trade_queue:
@@ -1812,7 +1875,6 @@ class VariationalToLighterRuntime:
                                 if open_rec:
                                     pending_rec.matched_open_key = open_key
                                     open_rec.matched_open_key = pending_key
-                            self._inflight_fill_event = None
                     # Pre-hedged token — for the case where the fill event arrives AFTER
                     # we release _order_in_flight (below); fast-path in
                     # process_variational_trade_event will merge fill price into pending_rec.
@@ -2270,6 +2332,7 @@ class VariationalToLighterRuntime:
                         "qty": decimal_to_str(record.qty),
                         "variational_filled_price": payload["variational_filled_price"],
                         "variational_filled_at": payload["variational_filled_at"],
+                        "variational_fill_source": payload["variational_fill_source"],
                         "lighter_order_side": payload["lighter_order_side"],
                         "lighter_client_order_id": payload["lighter_client_order_id"],
                         "lighter_filled_price": payload["lighter_filled_price"],
@@ -2299,6 +2362,7 @@ class VariationalToLighterRuntime:
             "qty",
             "variational_filled_price",
             "variational_filled_at",
+            "variational_fill_source",
             "lighter_order_side",
             "lighter_client_order_id",
             "lighter_filled_price",
