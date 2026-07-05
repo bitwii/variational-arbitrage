@@ -808,17 +808,44 @@ class VariationalToLighterRuntime:
         with path.open("a", encoding="utf-8") as handle:
             handle.write(line)
 
-    async def place_lighter_order(self, record: OrderLifecycle) -> None:
+    async def place_lighter_order(self, record: OrderLifecycle, is_close: bool = False) -> None:
         if not self.args.auto_hedge:
             return
 
         side = "SELL" if record.side == "buy" else "BUY"
 
+        if is_close:
+            # 平仓时把 qty 钳制到 Lighter 实际持仓——Lighter 下单永远是 reduce_only=False，
+            # 如果 Var/Lighter 两边仓位量有细微差异（qty 取整累积的零头，见
+            # notes/injection_failure_analysis.md 场景C），多出来的部分不会被拒绝，
+            # 而是直接反向开出一笔新仓，比 Variational 的 reduce-only 拒绝更危险。
+            available = abs(self._lighter_actual_qty)
+            if record.qty > available:
+                self.logger.warning(
+                    "place_lighter_order: 平仓量 %s 超过 Lighter 实际持仓 %s，钳制为实际持仓量 "
+                    "(trade_key=%s side=%s)",
+                    record.qty, available, record.trade_key, side,
+                )
+                record.qty = available
+            if record.qty <= Decimal("0.000001"):
+                self.logger.warning(
+                    "place_lighter_order: 钳制后 qty=0，Lighter 上已无仓位可平，跳过对冲 (trade_key=%s)",
+                    record.trade_key,
+                )
+                async with self._record_lock:
+                    record.hedge_error = "skipped_no_lighter_position_to_close"
+                    payload = record.to_payload()
+                await self.append_order_log("lighter_error", payload)
+                return
+
         # Guard: prevent creating an orphan Lighter position when the hedge leg is already gone.
         # Lighter API convention: positive qty = SHORT, negative qty = LONG.
         # A Lighter BUY closes an existing SHORT (positive qty). If there's no short, the BUY
         # would create a spurious LONG — only skip if Var is also not short (not a legitimate open).
-        if side == "BUY" and self._lighter_actual_qty <= Decimal("0.001"):
+        # Skipped when is_close already ran: that clamp is the more precise version of this same
+        # check (sized to actual available qty instead of a blanket <=0.001 cutoff), and applying
+        # this heuristic afterwards would wrongly skip a legitimately small, already-clamped close.
+        if not is_close and side == "BUY" and self._lighter_actual_qty <= Decimal("0.001"):
             cur_pos = self.runtime.monitor.positions.get(self.variational_ticker or "", {})
             var_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
             if var_qty > Decimal("-0.001"):
@@ -1570,6 +1597,9 @@ class VariationalToLighterRuntime:
             else:
                 has_long = cur_qty > Decimal("0.000001")
                 has_short = cur_qty < Decimal("-0.000001")
+            # portfolio 新鲜时 cur_qty 才可信，用于把平仓量钳制到实际持仓——避免标准仓位大小的
+            # 平仓单撞上 Variational 的 reduce-only 校验（notes/injection_failure_analysis.md 场景C）
+            _portfolio_fresh = _portfolio_age is None or _portfolio_age <= _PORTFOLIO_STALE_SEC
 
             # 仓位利用率越高，开仓门槛越严：空仓时按min_mult放宽，接近满仓时按max_mult收紧，
             # 只把剩下的一点配额留给特别好的机会
@@ -1599,6 +1629,8 @@ class VariationalToLighterRuntime:
                     var_bid, var_ask, lighter_bid, lighter_ask, cur_qty,
                 )
                 qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
+                if _portfolio_fresh:
+                    qty = min(qty, abs(cur_qty)).quantize(Decimal("0.000001"))
                 await self._write_bbo_snapshot(
                     var_bid, var_ask, lighter_bid, lighter_ask,
                     long_pct, short_pct, open_threshold, close_threshold, event="close",
@@ -1614,6 +1646,8 @@ class VariationalToLighterRuntime:
                     var_bid, var_ask, lighter_bid, lighter_ask, cur_qty,
                 )
                 qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
+                if _portfolio_fresh:
+                    qty = min(qty, abs(cur_qty)).quantize(Decimal("0.000001"))
                 await self._write_bbo_snapshot(
                     var_bid, var_ask, lighter_bid, lighter_ask,
                     long_pct, short_pct, open_threshold, close_threshold, event="close",
@@ -1670,6 +1704,8 @@ class VariationalToLighterRuntime:
                         "动态" if _using_dynamic else "兜底",
                     )
                     qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
+                    if _portfolio_fresh:
+                        qty = min(qty, abs(cur_qty)).quantize(Decimal("0.000001"))
                     await self._write_bbo_snapshot(
                         var_bid, var_ask, lighter_bid, lighter_ask,
                         long_pct, short_pct, open_threshold, close_threshold, event="close",
@@ -1711,6 +1747,8 @@ class VariationalToLighterRuntime:
                         "动态" if _using_dynamic else "兜底",
                     )
                     qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
+                    if _portfolio_fresh:
+                        qty = min(qty, abs(cur_qty)).quantize(Decimal("0.000001"))
                     await self._write_bbo_snapshot(
                         var_bid, var_ask, lighter_bid, lighter_ask,
                         long_pct, short_pct, open_threshold, close_threshold, event="close",
@@ -1835,7 +1873,7 @@ class VariationalToLighterRuntime:
                 async with self._record_lock:
                     self.records[pending_key] = pending_rec
                     self.record_order.append(pending_key)
-                lighter_task = asyncio.create_task(self.place_lighter_order(pending_rec))
+                lighter_task = asyncio.create_task(self.place_lighter_order(pending_rec, is_close=is_close))
 
             # 这里调用 Variational 的内部下单接口，传入方向、数量、滑点等参数
             result = await self.runtime.broker.place_order_internal(
