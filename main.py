@@ -957,7 +957,17 @@ class VariationalToLighterRuntime:
                 payload = record.to_payload()
             await self.append_order_log("lighter_error", payload)
 
-    async def _auto_correct_single_leg(self, var_qty: Decimal, lighter_qty: Decimal) -> None:
+    async def _auto_correct_single_leg(
+        self, var_qty: Decimal, lighter_qty: Decimal, standard_qty: Decimal | None = None,
+    ) -> None:
+        # 两边剩下的仓位都已经小到不值得精确对冲（低于标准下单量的10%）时，delta 往往比这还
+        # 小，容易撞上交易所自己的最小下单量限制（生产环境实测过：0.00004 BTC 被 Lighter 报
+        # code=21706 拒单）。这种情况下别去凑 delta，直接把两边各自清零。
+        _sweep_threshold = standard_qty * Decimal("0.10") if standard_qty is not None else Decimal("0.0001")
+        if abs(var_qty) < _sweep_threshold and abs(lighter_qty) < _sweep_threshold:
+            await self._sweep_dust_positions(var_qty, lighter_qty)
+            return
+
         # Lighter convention: positive qty = SHORT, negative = LONG. A correctly hedged
         # position has lighter_qty == var_qty (Var long X ↔ Lighter short X, same sign).
         # delta is how much Lighter needs to move to get back to that: positive → open more
@@ -987,6 +997,42 @@ class VariationalToLighterRuntime:
         )
         await self.place_lighter_order(corr_rec)
         await self.append_order_log("single_leg_auto_correct", corr_rec.to_payload())
+
+    async def _sweep_dust_positions(self, var_qty: Decimal, lighter_qty: Decimal) -> None:
+        # 两边残留仓位都已经小到不值得精确对冲——各自平自己的量直接清零，不追求两边 delta
+        # 匹配（匹配的话算出来的量通常更小，更容易撞上交易所的最小下单量限制）。
+        if abs(var_qty) > Decimal("0.000001"):
+            side = "sell" if var_qty > 0 else "buy"
+            amount = format(abs(var_qty), "f")
+            result = await self.runtime.broker.place_order_internal(
+                side=side, amount=amount, max_slippage=0.01, is_reduce_only=True,
+            )
+            if result.get("ok"):
+                self.logger.warning("DUST SWEEP: Var %s qty=%s 已清零", side, amount)
+            else:
+                self.logger.warning(
+                    "DUST SWEEP: Var 清仓失败 side=%s qty=%s error=%s", side, amount, result.get("error"),
+                )
+
+        if abs(lighter_qty) > Decimal("0.000001"):
+            # Lighter qty>0=空头需要BUY平掉，qty<0=多头需要SELL平掉；record.side 走
+            # place_lighter_order 的翻转规则（"sell"→Lighter BUY，"buy"→Lighter SELL）。
+            corr_side = "sell" if lighter_qty > 0 else "buy"
+            sweep_key = f"sweep:{int(time.monotonic() * 1000)}"
+            sweep_rec = OrderLifecycle(
+                trade_key=sweep_key,
+                trade_id=sweep_key,
+                side=corr_side,
+                qty=abs(lighter_qty).quantize(Decimal("0.000001")),
+                asset=self.variational_ticker or "UNKNOWN",
+                auto_hedge_enabled=True,
+                last_variational_status="dust_sweep",
+            )
+            async with self._record_lock:
+                self.records[sweep_key] = sweep_rec
+                self.record_order.append(sweep_key)
+            await self.place_lighter_order(sweep_rec)
+            await self.append_order_log("dust_sweep", sweep_rec.to_payload())
 
     def should_track_variational_event(self, event: dict[str, Any]) -> bool:
         side = str(event.get("side", "")).strip().lower()
@@ -1441,16 +1487,25 @@ class VariationalToLighterRuntime:
                 )
                 continue
 
-            var_long = var_qty > Decimal("0.001")
-            var_short = var_qty < Decimal("-0.001")
+            # 用标准下单量（VAR_ORDER_NOTIONAL_USDC 换算成 BTC）做基准，而不是写死的绝对值——
+            # 阈值会跟着仓位规模自动缩放。换算价用 Lighter 盘口中间价（已经在这个循环里查过
+            # 持仓，book 通常已经就绪；查不到就退回旧的固定 0.001 兜底，不阻塞整个检测）。
+            _lt_bid, _lt_ask = await self.get_lighter_best_bid_ask()
+            standard_qty: Decimal | None = None
+            if _lt_bid is not None and _lt_ask is not None and (_lt_bid + _lt_ask) > 0:
+                standard_qty = self.order_notional_usdc / ((_lt_bid + _lt_ask) / 2)
+            dust_ignore_qty = standard_qty * Decimal("0.02") if standard_qty is not None else Decimal("0.001")
+
+            var_long = var_qty > dust_ignore_qty
+            var_short = var_qty < -dust_ignore_qty
             # Lighter API convention: positive qty = SHORT position, negative qty = LONG position
-            lt_short = lighter_qty > Decimal("0.001")
-            lt_long = lighter_qty < Decimal("-0.001")
+            lt_short = lighter_qty > dust_ignore_qty
+            lt_long = lighter_qty < -dust_ignore_qty
 
             single_leg = (
                 (var_long and not lt_short)
                 or (var_short and not lt_long)
-                or (not var_long and not var_short and abs(lighter_qty) > Decimal("0.001"))
+                or (not var_long and not var_short and abs(lighter_qty) > dust_ignore_qty)
             )
             # Two-leg imbalance: both sides have positions in matching directions but
             # quantities differ significantly — indicates partial fill or hedge failure.
@@ -1459,7 +1514,7 @@ class VariationalToLighterRuntime:
             _IMBALANCE_WARN_PCT = Decimal("10")
             both_positioned = (var_long and lt_short) or (var_short and lt_long)
             imbalance_pct: Decimal | None = None
-            if not single_leg and both_positioned and abs(var_qty) > Decimal("0.001"):
+            if not single_leg and both_positioned and abs(var_qty) > dust_ignore_qty:
                 imbalance_pct = (
                     abs(abs(var_qty) - abs(lighter_qty)) / abs(var_qty) * 100
                 )
@@ -1470,7 +1525,7 @@ class VariationalToLighterRuntime:
                     "SINGLE-LEG DETECTED: var_qty=%s lighter_qty=%s — new opens blocked, auto-correcting",
                     var_qty, lighter_qty,
                 )
-                await self._auto_correct_single_leg(var_qty, lighter_qty)
+                await self._auto_correct_single_leg(var_qty, lighter_qty, standard_qty)
             elif imbalance_pct is not None and imbalance_pct > _IMBALANCE_WARN_PCT:
                 self._single_leg_blocked = True
                 self.logger.warning(
@@ -1478,7 +1533,7 @@ class VariationalToLighterRuntime:
                     "— new opens blocked, auto-correcting",
                     var_qty, lighter_qty, imbalance_pct, _IMBALANCE_WARN_PCT,
                 )
-                await self._auto_correct_single_leg(var_qty, lighter_qty)
+                await self._auto_correct_single_leg(var_qty, lighter_qty, standard_qty)
             else:
                 if self._single_leg_blocked:
                     reason = (
