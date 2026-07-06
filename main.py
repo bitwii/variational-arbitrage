@@ -10,7 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from statistics import median
 from typing import Any
@@ -108,6 +108,16 @@ def decimal_to_str(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return f"{value:,.6f}"
+
+
+def round_to_step(value: Decimal, step: Decimal) -> Decimal:
+    # 开仓量按 U 本位金额除以当时价格算出来，四舍五入到固定 BTC 步长，让这个数字变得"整"
+    # （比如 0.003 而不是 0.0031746）。真实的 U 本位价值会围绕 VAR_ORDER_NOTIONAL_USDC 有
+    # 一定浮动——这只在开仓时算一次；平仓不重新算，直接复用这次开仓记录下来的数字
+    # （signal_loop 里 _open_qty_queue_long/_short），从根上避免两次独立计算对不上。
+    if step <= 0:
+        return value.quantize(Decimal("0.000001"))
+    return (value / step).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * step
 
 
 # Variational's /api/quotes/accept is an RFQ-accept — the trade executes atomically at
@@ -321,6 +331,11 @@ class VariationalToLighterRuntime:
         self.open_confirm_ticks = int(os.getenv("VAR_OPEN_CONFIRM_TICKS", "2"))
         self.max_price_deviation_pct = Decimal(os.getenv("VAR_MAX_PRICE_DEVIATION_PCT", "10"))
         self.order_notional_usdc = Decimal(os.getenv("VAR_ORDER_NOTIONAL_USDC", "300"))
+        # 开仓量仍然按 U 本位金额除以当时价格算，但四舍五入到这个 BTC 步长——真实价值围绕
+        # VAR_ORDER_NOTIONAL_USDC 有一定浮动，换来一个"整"的 BTC 数字。这个数字算出来就记录
+        # 进 _open_qty_queue_long/_short（见下），平仓时直接复用，不再重新按当时价格计算，
+        # 从根上避免两次独立计算对不上（notes/injection_failure_analysis.md 场景C）。
+        self.qty_round_step = Decimal(os.getenv("VAR_QTY_ROUND_STEP", "0.001"))
         self.order_cooldown_seconds = float(os.getenv("VAR_ORDER_COOLDOWN_SECONDS", "120"))
         self.max_total_notional_usdc = Decimal(os.getenv("VAR_MAX_TOTAL_NOTIONAL_USDC", "1000"))
         self._open_long_notional: Decimal = Decimal("0")
@@ -360,6 +375,10 @@ class VariationalToLighterRuntime:
         self.record_order: deque[str] = deque(maxlen=500)
         self.lighter_client_order_to_trade_key: dict[int, str] = {}
         self._open_trade_queue: deque[str] = deque()  # FIFO queue of unmatched open keys
+        # 开仓时按当时价格算出来、四舍五入过的 qty，记录进这里；对应方向的平仓直接复用这个数字
+        # 下单，不重新按当时价格计算——从根上避免两次独立计算对不上（见 qty_round_step 注释）。
+        self._open_qty_queue_long: deque[Decimal] = deque()
+        self._open_qty_queue_short: deque[Decimal] = deque()
         self._record_lock = asyncio.Lock()
         self.cross_spread_history: deque[tuple[float, float | None, float | None]] = deque()
         # (monotonic_ts, var_book_spread_pct, lighter_book_spread_pct) — for threshold baseline
@@ -1507,13 +1526,12 @@ class VariationalToLighterRuntime:
                 var_qty = var_qty_real
                 self._var_position_estimate = var_qty_real
 
-            # 用标准下单量（VAR_ORDER_NOTIONAL_USDC 换算成 BTC）做基准，而不是写死的绝对值——
-            # 阈值会跟着仓位规模自动缩放。换算价用 Lighter 盘口中间价（已经在这个循环里查过
-            # 持仓，book 通常已经就绪；查不到就退回旧的固定 0.001 兜底，不阻塞整个检测）。
+            # 标准下单量按当前 Lighter 中间价把 VAR_ORDER_NOTIONAL_USDC 换算成 BTC 做基准——
+            # 阈值跟着这个基准按比例缩放。查不到盘口就退回旧的固定 0.001 兜底，不阻塞整个检测。
             _lt_bid, _lt_ask = await self.get_lighter_best_bid_ask()
             standard_qty: Decimal | None = None
             if _lt_bid is not None and _lt_ask is not None and (_lt_bid + _lt_ask) > 0:
-                standard_qty = self.order_notional_usdc / ((_lt_bid + _lt_ask) / 2)
+                standard_qty = round_to_step(self.order_notional_usdc / ((_lt_bid + _lt_ask) / 2), self.qty_round_step)
             dust_ignore_qty = standard_qty * Decimal("0.02") if standard_qty is not None else Decimal("0.001")
 
             var_long = var_qty > dust_ignore_qty
@@ -1707,7 +1725,11 @@ class VariationalToLighterRuntime:
                     short_pct, close_threshold, long_pct or 0, open_threshold,
                     var_bid, var_ask, lighter_bid, lighter_ask, cur_qty,
                 )
-                qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
+                # 直接复用开多时记录的数字，不重新按当时价格算——保证跟对应那笔开仓精确对齐
+                if self._open_qty_queue_long:
+                    qty = self._open_qty_queue_long[0]
+                else:
+                    qty = round_to_step(self.order_notional_usdc / var_bid, self.qty_round_step)
                 qty = min(qty, abs(_var_qty_ref)).quantize(Decimal("0.000001"))
                 await self._write_bbo_snapshot(
                     var_bid, var_ask, lighter_bid, lighter_ask,
@@ -1723,7 +1745,11 @@ class VariationalToLighterRuntime:
                     long_pct, close_threshold, short_pct or 0, open_threshold,
                     var_bid, var_ask, lighter_bid, lighter_ask, cur_qty,
                 )
-                qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
+                # 直接复用开空时记录的数字，不重新按当时价格算——保证跟对应那笔开仓精确对齐
+                if self._open_qty_queue_short:
+                    qty = self._open_qty_queue_short[0]
+                else:
+                    qty = round_to_step(self.order_notional_usdc / var_ask, self.qty_round_step)
                 qty = min(qty, abs(_var_qty_ref)).quantize(Decimal("0.000001"))
                 await self._write_bbo_snapshot(
                     var_bid, var_ask, lighter_bid, lighter_ask,
@@ -1780,7 +1806,10 @@ class VariationalToLighterRuntime:
                         long_pct, narrow_threshold,
                         "动态" if _using_dynamic else "兜底",
                     )
-                    qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
+                    if self._open_qty_queue_long:
+                        qty = self._open_qty_queue_long[0]
+                    else:
+                        qty = round_to_step(self.order_notional_usdc / var_bid, self.qty_round_step)
                     qty = min(qty, abs(_var_qty_ref)).quantize(Decimal("0.000001"))
                     await self._write_bbo_snapshot(
                         var_bid, var_ask, lighter_bid, lighter_ask,
@@ -1822,7 +1851,10 @@ class VariationalToLighterRuntime:
                         short_pct, narrow_threshold,
                         "动态" if _using_dynamic else "兜底",
                     )
-                    qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
+                    if self._open_qty_queue_short:
+                        qty = self._open_qty_queue_short[0]
+                    else:
+                        qty = round_to_step(self.order_notional_usdc / var_ask, self.qty_round_step)
                     qty = min(qty, abs(_var_qty_ref)).quantize(Decimal("0.000001"))
                     await self._write_bbo_snapshot(
                         var_bid, var_ask, lighter_bid, lighter_ask,
@@ -1867,7 +1899,7 @@ class VariationalToLighterRuntime:
                     )
                     self._open_confirm_count = 0
                     self._open_confirm_dir = ""
-                    qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
+                    qty = round_to_step(self.order_notional_usdc / var_ask, self.qty_round_step)
                     await self._write_bbo_snapshot(
                         var_bid, var_ask, lighter_bid, lighter_ask,
                         long_pct, short_pct, scaled_open_threshold, close_threshold, event="open",
@@ -1890,7 +1922,7 @@ class VariationalToLighterRuntime:
                     )
                     self._open_confirm_count = 0
                     self._open_confirm_dir = ""
-                    qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
+                    qty = round_to_step(self.order_notional_usdc / var_bid, self.qty_round_step)
                     await self._write_bbo_snapshot(
                         var_bid, var_ask, lighter_bid, lighter_ask,
                         long_pct, short_pct, scaled_open_threshold, close_threshold, event="open",
@@ -1970,13 +2002,21 @@ class VariationalToLighterRuntime:
                 if is_close:
                     if side == "sell":
                         self._open_long_notional = max(Decimal("0"), self._open_long_notional - self.order_notional_usdc)
+                        # 平多消费掉一笔记录过的开多数量——如果没有排队记录（比如重启后冷启动），
+                        # 就用这次实际下单的 qty 兜底，不阻塞逻辑。
+                        if self._open_qty_queue_long:
+                            self._open_qty_queue_long.popleft()
                     else:
                         self._open_short_notional = max(Decimal("0"), self._open_short_notional - self.order_notional_usdc)
+                        if self._open_qty_queue_short:
+                            self._open_qty_queue_short.popleft()
                 else:
                     if side == "buy":
                         self._open_long_notional += self.order_notional_usdc
+                        self._open_qty_queue_long.append(qty)
                     else:
                         self._open_short_notional += self.order_notional_usdc
+                        self._open_qty_queue_short.append(qty)
                 rfq_id = (result.get("data") or {}).get("rfq_id", "-")
                 # /api/quotes/accept 的响应体经生产验证只有 rfq_id/take_profit_rfq_id/
                 # stop_loss_rfq_id，不带成交价——accept 只确认订单被接受，真正成交价仍然只能
