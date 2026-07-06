@@ -326,6 +326,10 @@ class VariationalToLighterRuntime:
         self._open_long_notional: Decimal = Decimal("0")
         self._open_short_notional: Decimal = Decimal("0")
         self._lighter_actual_qty: Decimal = Decimal("0")  # signed qty synced from Lighter REST (negative=short)
+        # 本地维护的 Var 持仓估计——跟 _lighter_actual_qty 一样，每次自己下单成功就乐观更新。
+        # /portfolio WS 断连时的兜底：portfolio_age 一旦 stale，就不再信 monitor.positions 里
+        # 那份冻结的旧值，改用这个自己算出来的估计值做单腿检测和平仓钳制的参照。
+        self._var_position_estimate: Decimal = Decimal("0")
         self._lighter_sync_interval: float = float(os.getenv("VAR_LIGHTER_SYNC_INTERVAL_SECONDS", "60"))
         self._single_leg_blocked: bool = False
         self._open_confirm_count: int = 0
@@ -1009,6 +1013,9 @@ class VariationalToLighterRuntime:
             )
             if result.get("ok"):
                 self.logger.warning("DUST SWEEP: Var %s qty=%s 已清零", side, amount)
+                # 这次直接走 place_order_internal，没经过 _trigger_variational_order，
+                # 本地持仓估计要在这里手动同步，不然下次 portfolio 还是 stale 时会用错的值。
+                self._var_position_estimate += abs(var_qty) if side == "buy" else -abs(var_qty)
             else:
                 self.logger.warning(
                     "DUST SWEEP: Var 清仓失败 side=%s qty=%s error=%s", side, amount, result.get("error"),
@@ -1423,8 +1430,12 @@ class VariationalToLighterRuntime:
                     self.logger.info("Variational initial position: LONG %s BTC (~%s USDC)", var_qty, var_notional)
                 else:
                     self.logger.info("Variational initial position: SHORT %s BTC (~%s USDC)", var_qty, var_notional)
+            self._var_position_estimate = var_qty if var_qty is not None else Decimal("0")
         else:
             self.logger.info("Variational portfolio not yet streamed; using Lighter position as initial state")
+            # portfolio 还没推过来，先用 Lighter 真实持仓反推——正常情况下 var_qty 应该跟
+            # lighter_raw_qty 同号同值（Lighter正数=空头，对应Var多头），当个启动时的合理猜测。
+            self._var_position_estimate = lighter_raw_qty
 
         # ── Apply to notional counters ────────────────────────────────────────
         self._open_long_notional = lighter_long_notional
@@ -1464,7 +1475,7 @@ class VariationalToLighterRuntime:
             self._lighter_actual_qty = lighter_qty
 
             cur_pos = self.runtime.monitor.positions.get(self.variational_ticker or "", {})
-            var_qty = to_decimal(cur_pos.get("qty")) or Decimal("0")
+            var_qty_real = to_decimal(cur_pos.get("qty")) or Decimal("0")
 
             trading_state = await self.runtime.monitor.get_trading_state()
             portfolio_age = trading_state.get("portfolio_age")
@@ -1479,13 +1490,22 @@ class VariationalToLighterRuntime:
                         heartbeat_age,
                     )
                     self._hb_stale_log_ts = _now_mono
+            # portfolio 新鲜就用真实值并校准本地估计；stale 时不再直接 continue 放弃整轮检测——
+            # 那样等于单腿/失衡防护跟它想防的故障（WS断连）共用同一个失效条件。改用本地持仓估计
+            # （每次自己下单成功都同步更新）继续检测，好过完全裸奔（notes/injection_failure_
+            # analysis.md 场景C 事故：portfolio stale 一小时，裸露仓位没人管）。
             if portfolio_age is not None and portfolio_age > _PORTFOLIO_STALE_SECONDS:
-                self.logger.warning(
-                    "lighter_sync_loop: portfolio data stale (%.0fs) — skipping var_qty check, "
-                    "var_qty=%s may be outdated",
-                    portfolio_age, var_qty,
-                )
-                continue
+                var_qty = self._var_position_estimate
+                if time.monotonic() - getattr(self, "_portfolio_stale_sync_log_ts", 0) >= 600:
+                    self.logger.warning(
+                        "lighter_sync_loop: portfolio data stale (%.0fs) — using locally-tracked "
+                        "var_position_estimate=%s instead of skipping (frozen cur_qty=%s may be outdated)",
+                        portfolio_age, var_qty, var_qty_real,
+                    )
+                    self._portfolio_stale_sync_log_ts = time.monotonic()
+            else:
+                var_qty = var_qty_real
+                self._var_position_estimate = var_qty_real
 
             # 用标准下单量（VAR_ORDER_NOTIONAL_USDC 换算成 BTC）做基准，而不是写死的绝对值——
             # 阈值会跟着仓位规模自动缩放。换算价用 Lighter 盘口中间价（已经在这个循环里查过
@@ -1652,9 +1672,13 @@ class VariationalToLighterRuntime:
             else:
                 has_long = cur_qty > Decimal("0.000001")
                 has_short = cur_qty < Decimal("-0.000001")
-            # portfolio 新鲜时 cur_qty 才可信，用于把平仓量钳制到实际持仓——避免标准仓位大小的
-            # 平仓单撞上 Variational 的 reduce-only 校验（notes/injection_failure_analysis.md 场景C）
+            # portfolio 新鲜时用真实 cur_qty，并顺便把本地估计校准回真值；stale 时退回本地估计
+            # （每次自己下单成功都同步更新，见 _trigger_variational_order）。平仓钳制靠这个撑住，
+            # 而不是在 WS 断连时直接失去防护（notes/injection_failure_analysis.md 场景C 事故）。
             _portfolio_fresh = _portfolio_age is None or _portfolio_age <= _PORTFOLIO_STALE_SEC
+            if _portfolio_fresh:
+                self._var_position_estimate = cur_qty
+            _var_qty_ref = cur_qty if _portfolio_fresh else self._var_position_estimate
 
             # 仓位利用率越高，开仓门槛越严：空仓时按min_mult放宽，接近满仓时按max_mult收紧，
             # 只把剩下的一点配额留给特别好的机会
@@ -1684,8 +1708,7 @@ class VariationalToLighterRuntime:
                     var_bid, var_ask, lighter_bid, lighter_ask, cur_qty,
                 )
                 qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
-                if _portfolio_fresh:
-                    qty = min(qty, abs(cur_qty)).quantize(Decimal("0.000001"))
+                qty = min(qty, abs(_var_qty_ref)).quantize(Decimal("0.000001"))
                 await self._write_bbo_snapshot(
                     var_bid, var_ask, lighter_bid, lighter_ask,
                     long_pct, short_pct, open_threshold, close_threshold, event="close",
@@ -1701,8 +1724,7 @@ class VariationalToLighterRuntime:
                     var_bid, var_ask, lighter_bid, lighter_ask, cur_qty,
                 )
                 qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
-                if _portfolio_fresh:
-                    qty = min(qty, abs(cur_qty)).quantize(Decimal("0.000001"))
+                qty = min(qty, abs(_var_qty_ref)).quantize(Decimal("0.000001"))
                 await self._write_bbo_snapshot(
                     var_bid, var_ask, lighter_bid, lighter_ask,
                     long_pct, short_pct, open_threshold, close_threshold, event="close",
@@ -1759,8 +1781,7 @@ class VariationalToLighterRuntime:
                         "动态" if _using_dynamic else "兜底",
                     )
                     qty = (self.order_notional_usdc / var_bid).quantize(Decimal("0.000001"))
-                    if _portfolio_fresh:
-                        qty = min(qty, abs(cur_qty)).quantize(Decimal("0.000001"))
+                    qty = min(qty, abs(_var_qty_ref)).quantize(Decimal("0.000001"))
                     await self._write_bbo_snapshot(
                         var_bid, var_ask, lighter_bid, lighter_ask,
                         long_pct, short_pct, open_threshold, close_threshold, event="close",
@@ -1802,8 +1823,7 @@ class VariationalToLighterRuntime:
                         "动态" if _using_dynamic else "兜底",
                     )
                     qty = (self.order_notional_usdc / var_ask).quantize(Decimal("0.000001"))
-                    if _portfolio_fresh:
-                        qty = min(qty, abs(cur_qty)).quantize(Decimal("0.000001"))
+                    qty = min(qty, abs(_var_qty_ref)).quantize(Decimal("0.000001"))
                     await self._write_bbo_snapshot(
                         var_bid, var_ask, lighter_bid, lighter_ask,
                         long_pct, short_pct, open_threshold, close_threshold, event="close",
@@ -1944,6 +1964,9 @@ class VariationalToLighterRuntime:
                 self._last_variational_order_ts = time.monotonic()
                 self._injection_fail_count = 0
                 self._injection_fail_last_log_ts = 0.0
+                # 乐观更新本地 Var 持仓估计——buy always增加仓位（开多/平空），sell 相反，
+                # 跟 side/is_close 无关。/portfolio WS 断连时靠这个撑住单腿检测和平仓钳制。
+                self._var_position_estimate += qty if side == "buy" else -qty
                 if is_close:
                     if side == "sell":
                         self._open_long_notional = max(Decimal("0"), self._open_long_notional - self.order_notional_usdc)
@@ -2299,7 +2322,12 @@ class VariationalToLighterRuntime:
                 _bsl = Decimal(str(sum(v for _, v, _ in _e) / len(_e))) + Decimal(str(sum(l for _, _, l in _e) / len(_e)))
             else:
                 _bsl = (book_spread_percent(var_bid, var_ask) or Decimal("0")) + (book_spread_percent(lighter_bid, lighter_ask) or Decimal("0"))
-            open_thr = _bsl + self.open_profit_margin_pct
+            # 跟 signal_loop 的 scaled_open_threshold 保持一致——开仓阈值要按当前仓位利用率
+            # 乘 margin_mult 缩放，不能只显示没缩放的基准值，否则跟实际生效的判断对不上。
+            _actual_total_dash = self._open_long_notional + self._open_short_notional
+            _utilization_dash = min(max(_actual_total_dash / self.max_total_notional_usdc, Decimal("0")), Decimal("1"))
+            _margin_mult_dash = self.open_margin_min_mult + (self.open_margin_max_mult - self.open_margin_min_mult) * _utilization_dash
+            open_thr = _bsl + self.open_profit_margin_pct * _margin_mult_dash
             close_thr = _bsl + self.close_profit_margin_pct
             open_thr_abs = open_thr * var_ask / 100
             close_thr_abs = close_thr * var_ask / 100
@@ -2312,8 +2340,9 @@ class VariationalToLighterRuntime:
 
             min_floor_text = f"  绝对门槛≥[bold]{self.min_open_spread_pct:.4f}%[/bold]" if self.min_open_spread_pct > 0 else ""
             confirm_text = f"  确认{self._open_confirm_count}/{self.open_confirm_ticks}t" if self._open_confirm_count > 0 else ""
+            margin_mult_text = f"(×{_margin_mult_dash:.2f})"
             threshold_text = (
-                f"开仓阈值≥[bold]{open_thr:.4f}%[/bold]({open_thr_abs:.2f}U){min_floor_text}{confirm_text}  "
+                f"开仓阈值≥[bold]{open_thr:.4f}%[/bold]{margin_mult_text}({open_thr_abs:.2f}U){min_floor_text}{confirm_text}  "
                 f"平仓阈值≥[bold]{close_thr:.4f}%[/bold]({close_thr_abs:.2f}U)  "
                 f"收窄平仓<[bold]{self.narrow_close_pct:.2f}%[/bold]  │  "
                 f"当前价差 多{_fmt_spread(long_var_short_lighter_pct)}({_fmt_abs(long_abs)}) "
