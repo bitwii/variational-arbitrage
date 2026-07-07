@@ -1417,12 +1417,16 @@ class VariationalToLighterRuntime:
                 for pos in (acc.positions or []):
                     if pos.market_id != self.lighter_market_index:
                         continue
-                    qty = Decimal(str(pos.position))
+                    # pos.position 是不带方向的量（官方文档："Position: the amount of
+                    # position in that market"）——方向由独立的 pos.sign 字段给出
+                    # （官方文档："Sign: 1 for Long, -1 for Short"），不能靠 position 本身
+                    # 的正负去猜。main.py 内部约定是"正数=空头"（跟 Var 相反，方便配对），
+                    # 所以要取反：sign=1(多)→内部应为负，sign=-1(空)→内部应为正。
+                    qty = -Decimal(str(pos.sign)) * Decimal(str(pos.position))
                     if abs(qty) < Decimal("0.000001"):
                         continue
                     lighter_raw_qty = qty
                     value = abs(Decimal(str(pos.position_value)))
-                    # Lighter API convention: positive qty = SHORT position
                     if qty > 0:
                         lighter_long_notional = value   # Lighter SHORT → hedges Var LONG
                     else:
@@ -1477,7 +1481,9 @@ class VariationalToLighterRuntime:
                 for pos in (acc.positions or []):
                     if pos.market_id != self.lighter_market_index:
                         continue
-                    return Decimal(str(pos.position))
+                    # 同 load_initial_positions：方向来自 pos.sign（1=多，-1=空），不能靠
+                    # pos.position 的正负判断——它只是不带方向的量。
+                    return -Decimal(str(pos.sign)) * Decimal(str(pos.position))
             return Decimal("0")
         except Exception as exc:
             self.logger.warning("Lighter position sync failed: %s", exc)
