@@ -336,6 +336,11 @@ class VariationalToLighterRuntime:
         # 进 _open_qty_queue_long/_short（见下），平仓时直接复用，不再重新按当时价格计算，
         # 从根上避免两次独立计算对不上（notes/injection_failure_analysis.md 场景C）。
         self.qty_round_step = Decimal(os.getenv("VAR_QTY_ROUND_STEP", "0.001"))
+        # 单腿/失衡自动纠正每轮最多修多少（按标准仓位的倍数）——出现严重失衡时分批、逐步
+        # 减仓，而不是一次性打一个大单：大单滑点更大、更容易撞交易所的保证金/最小下单量限制，
+        # 上一次事故（0.006→0.384 BTC 连续翻倍）和这次（0.003→0.123 BTC）都是振荡/失控之后
+        # 一次性纠正量跟着变得很大。每轮只修一小步，多跑几个 60 秒周期，风险小很多。
+        self.correction_max_step_mult = Decimal(os.getenv("VAR_CORRECTION_MAX_STEP_MULT", "3"))
         self.order_cooldown_seconds = float(os.getenv("VAR_ORDER_COOLDOWN_SECONDS", "120"))
         self.max_total_notional_usdc = Decimal(os.getenv("VAR_MAX_TOTAL_NOTIONAL_USDC", "1000"))
         self._open_long_notional: Decimal = Decimal("0")
@@ -352,6 +357,14 @@ class VariationalToLighterRuntime:
         self._last_variational_order_ts: float = 0.0
         self._injection_fail_count: int = 0
         self._injection_fail_last_log_ts: float = 0.0
+        # 连续失败达到阈值就整体冷却一段时间——失败不会重置 order_cooldown_seconds，之前
+        # 遇到过 Var 下单持续失败（插件报价缓存丢失）却没有退避，signal_loop 几乎每个 tick
+        # 都在重试，3小时44分钟里失败了5679次，每次重试并发发出的 Lighter 那条腿只要偶尔
+        # 成功一次就现造一个新单腿（notes/injection_failure_analysis.md 场景F）。
+        self._consecutive_fail_count: int = 0
+        self._failure_cooldown_until: float = 0.0
+        self._failure_cooldown_threshold = int(os.getenv("VAR_FAILURE_COOLDOWN_THRESHOLD", "5"))
+        # 冷却时长复用 order_cooldown_seconds（跟成功后的下单冷却是同一个值），不用再单独配一个
         self._order_in_flight: bool = False
         self._inflight_order_side: str | None = None   # side of the current in-flight Var order
         self._inflight_fill_event: dict | None = None  # fill event buffered while in-flight
@@ -895,6 +908,38 @@ class VariationalToLighterRuntime:
             await self.append_order_log("lighter_error", payload)
             return
 
+        # 硬上限：不管走的是正常对冲、单腿纠正还是 dust sweep，这笔订单执行完之后 Lighter
+        # 的总仓位都不应该超过 VAR_MAX_TOTAL_NOTIONAL_USDC 换算出来的 BTC 数量——这是场景E/F
+        # 那两次事故本该有、但一直没有的最后一道硬闸门：signal_loop 正常开仓会check这个上限，
+        # 但 _auto_correct_single_leg/_sweep_dust_positions 完全绕过了它，纠正逻辑可以毫无
+        # 限制地把仓位越修越大（场景E 一路翻倍到 0.384 BTC，超过 $800 上限的30倍才被交易所
+        # 保证金拦下——不应该靠交易所拒单来兜底，我们自己就该先拦住）。
+        _mid_price = (best_bid + best_ask) / Decimal("2")
+        if _mid_price > 0:
+            _max_qty_btc = self.max_total_notional_usdc / _mid_price
+            _delta = record.qty if side == "SELL" else -record.qty
+            _resulting_qty = self._lighter_actual_qty + _delta
+            if abs(_resulting_qty) > _max_qty_btc:
+                _allowed_qty = max(Decimal("0"), _max_qty_btc - abs(self._lighter_actual_qty))
+                if _allowed_qty <= Decimal("0.000001"):
+                    self.logger.error(
+                        "place_lighter_order: 硬上限拦截——当前仓位 %s 已达/超过上限 %s BTC "
+                        "(VAR_MAX_TOTAL_NOTIONAL_USDC=%s)，拒绝下单 (trade_key=%s side=%s qty=%s)",
+                        self._lighter_actual_qty, _max_qty_btc, self.max_total_notional_usdc,
+                        record.trade_key, side, record.qty,
+                    )
+                    async with self._record_lock:
+                        record.hedge_error = "blocked_max_total_notional_exceeded"
+                        payload = record.to_payload()
+                    await self.append_order_log("lighter_error", payload)
+                    return
+                self.logger.error(
+                    "place_lighter_order: 硬上限钳制——qty=%s 会让仓位到 %s，超过上限 %s BTC，"
+                    "钳制为 %s (trade_key=%s side=%s)",
+                    record.qty, _resulting_qty, _max_qty_btc, _allowed_qty, record.trade_key, side,
+                )
+                record.qty = _allowed_qty
+
         slippage = Decimal(str(HEDGE_SLIPPAGE_BPS)) / Decimal("10000")
         if side == "BUY":
             is_ask = False
@@ -1001,6 +1046,17 @@ class VariationalToLighterRuntime:
             return
         corr_side = "buy" if delta > 0 else "sell"  # fed into place_lighter_order's side flip
         corr_qty = abs(delta).quantize(Decimal("0.000001"))
+
+        # 严重失衡时不要一把梭全部修完——分批、逐步减仓：每轮最多修 standard_qty 的
+        # correction_max_step_mult 倍，剩下的留到下一个 lighter_sync_loop 周期（60s 后）
+        # 继续修。大单一次性打出去滑点更大，也更容易撞上交易所的保证金/最小下单量限制——
+        # 这正是前两次事故（0.006→0.384 BTC 连续翻倍、0.003→0.123 BTC 单次失衡）里
+        # 单笔纠正量跟着失衡幅度一起失控变大的原因。
+        max_step = standard_qty * self.correction_max_step_mult if standard_qty is not None else None
+        is_partial = max_step is not None and corr_qty > max_step
+        if is_partial:
+            corr_qty = max_step.quantize(Decimal("0.000001"))
+
         corr_key = f"autocorr:{int(time.monotonic() * 1000)}"
         corr_rec = OrderLifecycle(
             trade_key=corr_key,
@@ -1015,8 +1071,11 @@ class VariationalToLighterRuntime:
             self.records[corr_key] = corr_rec
             self.record_order.append(corr_key)
         self.logger.warning(
-            "SINGLE-LEG AUTO-CORRECT: var_qty=%s lighter_qty=%s → Lighter %s qty=%s to rebalance",
+            "SINGLE-LEG AUTO-CORRECT%s: var_qty=%s lighter_qty=%s → Lighter %s qty=%s to rebalance%s",
+            " (partial/gradual)" if is_partial else "",
             var_qty, lighter_qty, "SELL" if corr_side == "buy" else "BUY", corr_qty,
+            f" (full delta={abs(delta):.6f}, capped to {self.correction_max_step_mult}x standard size, "
+            f"will continue next cycle)" if is_partial else "",
         )
         await self.place_lighter_order(corr_rec)
         await self.append_order_log("single_leg_auto_correct", corr_rec.to_payload())
@@ -1599,6 +1658,14 @@ class VariationalToLighterRuntime:
             if self._order_in_flight:
                 continue
             _now = time.monotonic()
+            if _now < self._failure_cooldown_until:
+                if _now - getattr(self, "_failure_cooldown_log_ts", 0) >= 30:
+                    self.logger.warning(
+                        "signal_loop: 连续失败冷却中，剩余 %.0fs 不下单",
+                        self._failure_cooldown_until - _now,
+                    )
+                    self._failure_cooldown_log_ts = _now
+                continue
             _cooldown_remaining = self.order_cooldown_seconds - (_now - self._last_variational_order_ts)
             if _cooldown_remaining > 0:
                 if _now - getattr(self, "_cooldown_log_ts", 0) >= 60:
@@ -1938,6 +2005,19 @@ class VariationalToLighterRuntime:
                 self._open_confirm_count = 0
                 self._open_confirm_dir = ""
 
+    def _register_order_failure(self) -> None:
+        # 连续失败达到阈值就整体冷却——避免下单管道持续坏掉时 signal_loop 每个 tick 都在
+        # 重试（之前实测过3小时44分钟内失败5679次），冷却期间 _trigger_variational_order
+        # 根本不会被调用，也就不会再有并发发出的 Lighter 那条腿去制造新单腿。
+        self._consecutive_fail_count += 1
+        if self._consecutive_fail_count >= self._failure_cooldown_threshold:
+            self._failure_cooldown_until = time.monotonic() + self.order_cooldown_seconds
+            self.logger.warning(
+                "signal_loop: Var 下单连续失败 %d 次，进入 %.0f 秒冷却，期间不再下单",
+                self._consecutive_fail_count, self.order_cooldown_seconds,
+            )
+            self._consecutive_fail_count = 0
+
     async def _trigger_variational_order(
         self, side: str, qty: Decimal, trigger_pct: Decimal, is_close: bool = False,
         quote_age_ms: float | None = None,
@@ -1957,6 +2037,25 @@ class VariationalToLighterRuntime:
         pending_rec: OrderLifecycle | None = None
         lighter_task: asyncio.Task | None = None
         try:
+            # 硬上限：跟 place_lighter_order 里那道一样——开仓（不是平仓）执行完之后，Var 侧
+            # 的总仓位不应该超过 VAR_MAX_TOTAL_NOTIONAL_USDC 换算出来的 BTC 数量。平仓永远在
+            # 减少敞口，不需要也不应该被这道检查挡住。这是 Var 下单唯一的共同入口，在这里
+            # 查一次就覆盖所有触发路径（条件A/B、开仓确认）。
+            if not is_close:
+                _var_bid_chk, _var_ask_chk, _, _ = await self.get_variational_best_bid_ask(self.variational_ticker)
+                if _var_bid_chk is not None and _var_ask_chk is not None:
+                    _mid_chk = (_var_bid_chk + _var_ask_chk) / Decimal("2")
+                    if _mid_chk > 0:
+                        _max_qty_btc_var = self.max_total_notional_usdc / _mid_chk
+                        _resulting_var_qty = self._var_position_estimate + (qty if side == "buy" else -qty)
+                        if abs(_resulting_var_qty) > _max_qty_btc_var:
+                            self.logger.error(
+                                "trigger_variational_order: 硬上限拦截——开仓 side=%s qty=%s 会让 "
+                                "Var 仓位到 %s，超过上限 %s BTC (VAR_MAX_TOTAL_NOTIONAL_USDC=%s)，"
+                                "拒绝下单",
+                                side, qty, _resulting_var_qty, _max_qty_btc_var, self.max_total_notional_usdc,
+                            )
+                            return
             # Suppress "Signal triggered" noise while injection is consistently failing
             if self._injection_fail_count == 0:
                 self.logger.info(
@@ -2002,6 +2101,7 @@ class VariationalToLighterRuntime:
                 self._last_variational_order_ts = time.monotonic()
                 self._injection_fail_count = 0
                 self._injection_fail_last_log_ts = 0.0
+                self._consecutive_fail_count = 0
                 # 乐观更新本地 Var 持仓估计——buy always增加仓位（开多/平空），sell 相反，
                 # 跟 side/is_close 无关。/portfolio WS 断连时靠这个撑住单腿检测和平仓钳制。
                 self._var_position_estimate += qty if side == "buy" else -qty
@@ -2145,10 +2245,12 @@ class VariationalToLighterRuntime:
                         "Variational order failed (%s): side=%s qty=%s error=%s",
                         action, side, qty_str, error_msg,
                     )
+                self._register_order_failure()
         except Exception as exc:
             self._last_variational_order_ts = time.monotonic()
             self._injection_fail_count = 0
             self.logger.error("Variational order error: %s", exc)
+            self._register_order_failure()
         finally:
             self._inflight_fill_event = None
             self._inflight_order_side = None

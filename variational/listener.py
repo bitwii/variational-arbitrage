@@ -69,6 +69,7 @@ class VariationalMonitor:
     _last_hourly_alert_hour: int = 0
     _next_trade_event_seq: int = 1
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    _position_schema_dumped: set[str] = field(default_factory=set)
 
     async def process_rest_event(self, payload: dict[str, Any]) -> list[str]:
         if payload.get("kind") != "rest_response":
@@ -295,6 +296,16 @@ class VariationalMonitor:
                 continue
 
             asset = str(instrument.get("underlying", "UNKNOWN"))
+            # 诊断：qty 的正负号目前被当成方向在用（正=多/负=空），但从没验证过 Variational
+            # 是否真的这样定义，还是像 Lighter 那样另有独立的方向字段而 qty 只是数量
+            # （notes/injection_failure_analysis.md 场景E 就是这类假设错了导致的事故）。
+            # 每个资产只打一次完整原始 payload，等下次真实数据回来后核对 schema。
+            if asset not in self._position_schema_dumped:
+                self._position_schema_dumped.add(asset)
+                _monitor_log.info(
+                    "[VAR_POSITION_SCHEMA] asset=%s qty=%r raw_position_info=%r raw_item_keys=%r",
+                    asset, position_info.get("qty"), position_info, list(item.keys()),
+                )
             next_positions[asset] = {
                 "asset": asset,
                 "qty": position_info.get("qty"),
