@@ -98,6 +98,24 @@ class VariationalMonitor:
 
     async def process_ws_event(self, payload: dict[str, Any]) -> list[str]:
         kind = str(payload.get("kind", ""))
+        # background.js 在 Network.webSocketClosed / webSocketFrameError 时早就把这两种事件
+        # 转发过来了，但这里之前只认 "ws_frame"，两种诊断信号一直被静默丢弃——之前反复遇到
+        # /events、/portfolio 长时间 stale 却查不出页面自己的 WS 到底是断线了、还是没断线但
+        # 不再收到帧（僵尸连接），就是因为这个信号从来没被记录下来。
+        if kind == "ws_closed":
+            url = str(payload.get("url", ""))
+            _monitor_log.warning(
+                "[VAR_WS_CLOSED] 页面自己的 WebSocket 断开了：stream=%s url=%s requestId=%s "
+                "ts=%s — 如果之后 heartbeat/portfolio 一直不恢复，说明页面没有重新建立这条连接",
+                classify_ws_stream(url) or "?", url, payload.get("requestId"), payload.get("timestamp"),
+            )
+            return []
+        if kind == "ws_frame_error":
+            _monitor_log.warning(
+                "[VAR_WS_FRAME_ERROR] url=%s requestId=%s error=%r",
+                payload.get("url"), payload.get("requestId"), payload.get("errorMessage"),
+            )
+            return []
         if kind != "ws_frame":
             return []
         if payload.get("direction") != "received":
