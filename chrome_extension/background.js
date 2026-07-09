@@ -8,7 +8,8 @@ const DEFAULT_CONFIG = {
   commandEndpoint: "ws://127.0.0.1:8768",
   domainFilter: "variational",
   restAllowlist: [
-    "https://omni.variational.io/api/quotes/indicative"
+    "https://omni.variational.io/api/quotes/indicative",
+    "https://omni.variational.io/api/quotes/accept"
   ],
   wsAllowlist: [
     "wss://omni-ws-server.prod.ap-northeast-1.variational.io/events",
@@ -485,7 +486,9 @@ function sanitizeAllowlist(value, fallback) {
 
 function sanitizeRestAllowlist(value) {
   const cleaned = sanitizeAllowlist(value, DEFAULT_CONFIG.restAllowlist);
-  const strict = cleaned.filter((item) => item === DEFAULT_CONFIG.restAllowlist[0]);
+  // 只允许我们自己硬编码的默认集合里的条目通过，不能是任意用户/存储配置传进来的URL——
+  // 之前这里写死只比对 restAllowlist[0]，只要默认集合超过一条就会把后面的条目全部过滤掉。
+  const strict = cleaned.filter((item) => DEFAULT_CONFIG.restAllowlist.includes(item));
   if (!strict.length) {
     return [...DEFAULT_CONFIG.restAllowlist];
   }
@@ -769,6 +772,15 @@ async function handleDebuggerEvent(source, method, params) {
         url: params.url,
         matchedPattern,
         createdAt: nowIso()
+      });
+      // 之前这里只在本地记了一下，从来没告诉过 Python 侧"页面又建了一条新连接"——
+      // 断连之后要判断"页面到底有没有尝试重连"，全靠这条信号，之前完全看不到。
+      wsForwarder.send({
+        kind: "ws_created",
+        requestId: params.requestId,
+        url: params.url,
+        matchedPattern,
+        timestamp: nowIso()
       });
     }
     return;

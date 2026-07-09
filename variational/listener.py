@@ -21,6 +21,10 @@ _monitor_log = _logging.getLogger("var_lighter_runtime")
 
 
 QUOTES_INDICATIVE_PATH = "/api/quotes/indicative"
+QUOTES_ACCEPT_PATH = "/api/quotes/accept"
+# 限流相关响应头的关键字，不区分大小写子串匹配——目前不知道 Variational 真正会用哪个头，
+# 先把常见命名都覆盖到，宁可多打印几次也不要漏掉。
+_RATE_LIMIT_HEADER_HINTS = ("ratelimit", "rate-limit", "retry-after", "x-rl-")
 WS_EVENTS_PATH = "/events"
 WS_PORTFOLIO_PATH = "/portfolio"
 QUOTE_LOG_INTERVAL_SECONDS = 30
@@ -70,6 +74,24 @@ class VariationalMonitor:
     _next_trade_event_seq: int = 1
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _position_schema_dumped: set[str] = field(default_factory=set)
+    _rest_headers_dumped: set[str] = field(default_factory=set)
+
+    def _check_rate_limit_headers(self, endpoint: str, payload: dict[str, Any]) -> None:
+        headers = payload.get("headers")
+        status = payload.get("status")
+        if isinstance(headers, dict):
+            hits = {
+                k: v for k, v in headers.items()
+                if any(hint in str(k).lower() for hint in _RATE_LIMIT_HEADER_HINTS)
+            }
+            if hits:
+                _monitor_log.warning("[VAR_RATE_LIMIT_HEADER] endpoint=%s status=%s headers=%r", endpoint, status, hits)
+        # 每个 endpoint 只完整打一次全部响应头，留个基线备查；限流命中的话上面那条不受这个限制。
+        if endpoint not in self._rest_headers_dumped:
+            self._rest_headers_dumped.add(endpoint)
+            _monitor_log.info("[VAR_REST_HEADERS] endpoint=%s status=%s headers=%r", endpoint, status, headers)
+        if isinstance(status, int) and status >= 400:
+            _monitor_log.warning("[VAR_REST_ERROR_STATUS] endpoint=%s status=%s headers=%r", endpoint, status, headers)
 
     async def process_rest_event(self, payload: dict[str, Any]) -> list[str]:
         if payload.get("kind") != "rest_response":
@@ -77,6 +99,21 @@ class VariationalMonitor:
 
         url = str(payload.get("url", ""))
         endpoint = classify_rest_endpoint(url)
+        if endpoint is None:
+            return []
+
+        self._check_rate_limit_headers(endpoint, payload)
+
+        if endpoint == QUOTES_ACCEPT_PATH:
+            # accept 频率很低（一笔交易才一次），完整记一次原始响应方便以后分析，不用像
+            # indicative 那样只留一次基线——每笔的实际下单结果都值得单独看。
+            body = decode_response_body(payload)
+            _monitor_log.info(
+                "[VAR_ACCEPT_RESPONSE] status=%s body=%s",
+                payload.get("status"), body if body is not None else "<decode failed>",
+            )
+            return []
+
         if endpoint != QUOTES_INDICATIVE_PATH:
             return []
 
@@ -116,6 +153,16 @@ class VariationalMonitor:
                 payload.get("url"), payload.get("requestId"), payload.get("errorMessage"),
             )
             return []
+        if kind == "ws_created":
+            # 断连之后页面到底有没有尝试重连，只能靠这个信号判断——如果 [VAR_WS_CLOSED] 之后
+            # 一直没有对应 stream 的 [VAR_WS_CREATED]，说明页面根本没有发起新连接尝试；如果有
+            # 但心跳还是没恢复，说明是新连接本身有问题（重连了但连不上/连上了收不到消息）。
+            url = str(payload.get("url", ""))
+            _monitor_log.warning(
+                "[VAR_WS_CREATED] 页面建立了新的 WebSocket 连接：stream=%s url=%s requestId=%s ts=%s",
+                classify_ws_stream(url) or "?", url, payload.get("requestId"), payload.get("timestamp"),
+            )
+            return []
         if kind != "ws_frame":
             return []
         if payload.get("direction") != "received":
@@ -132,6 +179,13 @@ class VariationalMonitor:
 
         parsed = try_parse_json(message_text)
         if parsed is None:
+            # 之前这里直接静默丢弃——close 帧本身（opcode 8，带关闭代码+原因）如果被当成普通
+            # 帧转发过来，内容不是 JSON，会一路走到这里被吞掉，永远看不到关闭原因。截断一下
+            # 避免超大二进制帧把日志打爆，但保留前200字符应该够看出是不是 close 帧的内容。
+            _monitor_log.warning(
+                "[VAR_WS_UNPARSEABLE_FRAME] stream=%s url=%s opcode=%s raw=%r",
+                stream, url, payload.get("opcode"), message_text[:200],
+            )
             return []
 
         async with self._lock:
@@ -812,6 +866,8 @@ def classify_rest_endpoint(url: str) -> str | None:
         return None
     if path == QUOTES_INDICATIVE_PATH:
         return QUOTES_INDICATIVE_PATH
+    if path == QUOTES_ACCEPT_PATH:
+        return QUOTES_ACCEPT_PATH
     return None
 
 
