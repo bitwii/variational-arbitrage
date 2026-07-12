@@ -153,6 +153,17 @@ class VariationalMonitor:
                 payload.get("url"), payload.get("requestId"), payload.get("errorMessage"),
             )
             return []
+        if kind == "cdp_detached":
+            # 扩展现在会在 chrome.debugger.onDetach 触发时把 reason 转发过来——之前这个信息
+            # 只存在于 popup 里，popup 一关就没了，runtime.log 完全没有记录，没法事后排查
+            # 断连原因。常见 reason：target_closed（标签页关闭/被丢弃）、canceled_by_user、
+            # replaced_with_devtools_inspector（同一个标签页开了真正的 DevTools）。如果这里
+            # 频繁出现且 reason 查不出名堂，多半是 MV3 service worker 被 Chrome 空闲回收。
+            _monitor_log.warning(
+                "[VAR_CDP_DETACHED] Chrome debugger 会话断开：tabId=%s reason=%s ts=%s",
+                payload.get("tabId"), payload.get("reason"), payload.get("timestamp"),
+            )
+            return []
         if kind == "ws_created":
             # 断连之后页面到底有没有尝试重连，只能靠这个信号判断——如果 [VAR_WS_CLOSED] 之后
             # 一直没有对应 stream 的 [VAR_WS_CREATED]，说明页面根本没有发起新连接尝试；如果有

@@ -3,7 +3,7 @@
   "name": "Variational CDP Forwarder",
   "version": "1.0.0",
   "description": "Capture Variational REST responses and WebSocket frames via CDP and forward to local WebSocket ports.",
-  "permissions": ["debugger", "tabs", "storage", "activeTab"],
+  "permissions": ["debugger", "tabs", "storage", "activeTab", "alarms"],
   "host_permissions": ["<all_urls>"],
   "action": {
     "default_title": "Variational Forwarder",

@@ -1,6 +1,13 @@
 const DEBUGGER_VERSION = "1.3";
 const MAX_QUEUE_SIZE = 1000;
 const AUTO_RELOAD_COOLDOWN_MS = 5000;
+// MV3 service worker 在约30秒无活动后会被 Chrome 回收，回收后内存里的 state（active/
+// attachedTabId/三个 forwarder socket）全部丢失，且很多 Chrome 版本上 CDP 附着本身也会
+// 跟着失效——之前完全没有 keepalive，只能靠用户发现断连后手动重开 popup 点 Start。
+// 用 alarm 定期唤醒可以把 SW 的空闲计时器重置，配合下面的 fwActiveState 持久化 + 唤醒后
+// 自动重新 attach，可以做到不用人工介入。
+const KEEPALIVE_ALARM = "cdpForwarderKeepAlive";
+const KEEPALIVE_PERIOD_MINUTES = 0.4; // ~24s，小于30秒的回收阈值
 
 const DEFAULT_CONFIG = {
   wsEndpoint: "ws://127.0.0.1:8766",
@@ -548,6 +555,13 @@ async function debuggerAttach(tabId) {
     chrome.debugger.attach({ tabId }, DEBUGGER_VERSION, () => {
       const err = chrome.runtime.lastError;
       if (err) {
+        // service worker 被回收再唤醒时，浏览器底层的 CDP 附着有时其实还在（只是我们的
+        // 内存 state 丢了），这时重新 attach 会报 "already attached"——当成成功处理，
+        // 否则唤醒后自动恢复会在这里直接失败。
+        if (/already attached/i.test(err.message)) {
+          resolve();
+          return;
+        }
         reject(new Error(err.message));
         return;
       }
@@ -617,6 +631,8 @@ async function startForwarding(tabId = null) {
   state.active = true;
   state.attachedTabId = targetTabId;
   state.lastError = null;
+  persistActiveState();
+  startKeepAliveAlarm();
   wsForwarder.connect();
   restForwarder.connect();
   commandSocket.connect();
@@ -646,10 +662,81 @@ function cleanupForwardingState() {
   state.attachedTabId = null;
   state.lastAutoReloadAt = 0;
   state.hookScriptId = null;
+  stopKeepAliveAlarm();
+  persistActiveState();
   wsForwarder.close();
   restForwarder.close();
   commandSocket.close();
 }
+
+// 持久化到 chrome.storage.local，而不只是内存里的 state——service worker 被回收后内存
+// 清零，唤醒时得靠这份记录才知道"之前是不是在转发、附着在哪个 tab"，否则只能永远停在
+// active=false，需要人工重新点 Start。
+async function persistActiveState() {
+  try {
+    await chrome.storage.local.set({
+      fwActiveState: { active: state.active, tabId: state.attachedTabId }
+    });
+  } catch {
+    // storage 写失败不影响当前会话，下次唤醒重新走一遍 startForwarding 即可。
+  }
+}
+
+function startKeepAliveAlarm() {
+  chrome.alarms.create(KEEPALIVE_ALARM, { periodInMinutes: KEEPALIVE_PERIOD_MINUTES });
+}
+
+function stopKeepAliveAlarm() {
+  chrome.alarms.clear(KEEPALIVE_ALARM);
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== KEEPALIVE_ALARM) {
+    return;
+  }
+  // 这个监听器本身触发就足以重置 SW 的空闲计时器；顺带检查一下三个 forwarder socket，
+  // 万一某个连接悄悄断了（没触发 onclose）也能借这个心跳周期补一次重连。
+  if (!state.active) {
+    return;
+  }
+  wsForwarder.connect();
+  restForwarder.connect();
+  commandSocket.connect();
+});
+
+// service worker 每次被（重新）实例化时都会执行一遍模块顶层代码，包括被 Chrome 回收后
+// 因为收到 alarm/debugger 事件而重新拉起的情况——不仅仅是浏览器重启（onStartup 只在
+// 浏览器重启时触发一次）。用这个入口把上次的转发状态自动恢复，不需要用户重新点 Start。
+async function restoreForwardingOnWake() {
+  await ensureConfigLoaded();
+  const stored = await chrome.storage.local.get("fwActiveState");
+  const saved = stored.fwActiveState;
+  if (!saved || !saved.active || saved.tabId == null) {
+    return;
+  }
+
+  try {
+    await chrome.tabs.get(saved.tabId);
+  } catch {
+    // 标签页已经不存在了，没什么可恢复的。
+    await chrome.storage.local.set({ fwActiveState: { active: false, tabId: null } });
+    return;
+  }
+
+  try {
+    await startForwarding(saved.tabId);
+  } catch (error) {
+    state.lastError = `Resume after service worker wake failed: ${error.message}`;
+    await chrome.storage.local.set({ fwActiveState: { active: false, tabId: null } });
+    notifyStatus();
+  }
+}
+
+chrome.runtime.onStartup.addListener(() => {
+  restoreForwardingOnWake().catch(() => {});
+});
+
+restoreForwardingOnWake().catch(() => {});
 
 function getStatus() {
   return {
@@ -840,8 +927,42 @@ chrome.debugger.onDetach.addListener((source, reason) => {
     return;
   }
   state.lastError = `Debugger detached: ${reason}`;
+  // 之前这个 reason 只写进 state.lastError，只有 popup 开着才看得到，runtime.log 里完全
+  // 没有记录——发生在没人盯着 popup 的时候就永远查不出原因了。发一份到 Python 侧落盘。
+  // 要在 cleanupForwardingState() 关掉 socket 之前发，晚了就发不出去了。
+  wsForwarder.send({
+    kind: "cdp_detached",
+    tabId: source.tabId,
+    reason: reason || "unknown",
+    timestamp: nowIso()
+  });
+
+  const detachedTabId = source.tabId;
   cleanupForwardingState();
   notifyStatus();
+
+  // chrome.debugger 的 DetachReason 只有两种：canceled_by_user（用户主动分离，比如在这个
+  // 标签页打开了真正的 DevTools）和 target_closed。canceled_by_user 才是真的"别管了"；
+  // target_closed 很多时候只是页面刷新/导航导致内部 CDP target 被替换，tabId 对应的标签页
+  // 其实还在，完全可以自动重新 attach——之前这里一律清空 active 并持久化，保活 alarm 唤醒后
+  // 看到 active=false 就放弃恢复，等于每次页面刷新都要靠人工重新点 Start，之前一次 5 小时
+  // 的断连就是这么来的。
+  if (reason === "canceled_by_user") {
+    return;
+  }
+  (async () => {
+    try {
+      await chrome.tabs.get(detachedTabId);
+    } catch {
+      return; // 标签页真的关闭了，没什么可恢复的
+    }
+    try {
+      await startForwarding(detachedTabId);
+    } catch (error) {
+      state.lastError = `Auto re-attach after detach failed: ${error.message}`;
+      notifyStatus();
+    }
+  })();
 });
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
