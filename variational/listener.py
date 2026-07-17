@@ -164,6 +164,24 @@ class VariationalMonitor:
                 payload.get("tabId"), payload.get("reason"), payload.get("timestamp"),
             )
             return []
+        if kind == "page_ws_stale_reload":
+            # 插件自己检测到某条页面级 WebSocket（/events 或 /portfolio）超过阈值没有新帧，
+            # 且没有发生 CDP detach（否则会走 onDetach 的自动重连），判定为页面自身的重连
+            # 逻辑没有触发，于是主动 chrome.tabs.reload() 刷新页面。这条日志标记"已自动
+            # 处理"，之后应该能看到对应的 [VAR_WS_CREATED]；如果刷新后心跳还是没恢复，
+            # 说明这次不是页面重连问题，需要人工介入。streak>1 表示连续第N次刷新同一条流
+            # 都没能等到真实帧恢复——之前发生过一次刷新没生效、机制不再重试、卡死6小时的
+            # 事故，现在改成会持续重试，但 streak 持续增长仍然说明自动刷新对这次故障没用，
+            # 需要人工介入（比如页面需要重新登录/网络问题/浏览器标签页本身卡死）。
+            streak = payload.get("streak")
+            level = _monitor_log.warning if not streak or streak < 3 else _monitor_log.error
+            level(
+                "[VAR_PAGE_WS_STALE_RELOAD] 页面级WebSocket假死，插件已自动刷新标签页："
+                "pattern=%s stale_ms=%s streak=%s ts=%s%s",
+                payload.get("pattern"), payload.get("staleMs"), streak, payload.get("timestamp"),
+                " —— 连续多次刷新仍未恢复，可能需要人工介入" if streak and streak >= 3 else "",
+            )
+            return []
         if kind == "ws_created":
             # 断连之后页面到底有没有尝试重连，只能靠这个信号判断——如果 [VAR_WS_CLOSED] 之后
             # 一直没有对应 stream 的 [VAR_WS_CREATED]，说明页面根本没有发起新连接尝试；如果有

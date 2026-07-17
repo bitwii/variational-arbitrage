@@ -603,6 +603,26 @@ class VariationalToLighterRuntime:
     async def request_fresh_snapshot(self, ws: Any) -> None:
         await ws.send(json.dumps({"type": "subscribe", "channel": f"order_book/{self.lighter_market_index}"}))
 
+    def _try_finalize_roundtrip_pnl(self, record: "OrderLifecycle") -> None:
+        # 之前这段计算只写在 handle_lighter_fill_update 里，隐含假设"Lighter 那腿的成交回调
+        # 一定在 Variational 那腿的成交事件处理完之后才跑"——但这只是两条独立异步路径的
+        # 时序巧合，不是保证。一旦 Lighter 的成交回调先跑到，当时 record.var_fill_price
+        # 还是 None，pnl 计算直接跳过且不会重试，Variational 那腿随后到达时也没人再触发
+        # 一次计算，roundtrip_pnl 永久留空（HYPE 07-15 12:47 那笔实测遇到）。抽成公共方法，
+        # 两腿各自成交后都调用一次，谁最后到位就由谁把 pnl 补上，与到达顺序无关。
+        if record.roundtrip_pnl is not None or record.side != "sell" or not record.matched_open_key:
+            return
+        open_rec = self.records.get(record.matched_open_key)
+        if not (open_rec and open_rec.var_fill_price and open_rec.lighter_fill_price
+                and record.var_fill_price and record.lighter_fill_price):
+            return
+        # 开平仓量可能对不上（比如平仓时对方交易所实际持仓比预期少，被钳制成交）——按两笔
+        # 里较小的那个量结算，避免拿一个从未真正平掉的名义数量去算盈亏。
+        qty = min(open_rec.qty, record.qty)
+        record.var_pnl = (record.var_fill_price - open_rec.var_fill_price) * qty
+        record.lt_pnl = (open_rec.lighter_fill_price - record.lighter_fill_price) * qty
+        record.roundtrip_pnl = record.var_pnl + record.lt_pnl
+
     async def handle_lighter_fill_update(self, order: dict[str, Any]) -> None:
         if order.get("status") != "filled":
             return
@@ -648,18 +668,13 @@ class VariationalToLighterRuntime:
             record.lighter_fill_ts_iso = now_iso
             record.lighter_fill_price = fill_price
 
-            # Compute round-trip P&L once both legs of a close trade are filled
+            # Compute round-trip P&L once both legs of a close trade are filled.
             # P&L is computed per-exchange (funds don't cross exchanges):
             #   Var P&L  = (var_close - var_open) × qty   ← long position on Variational
             #   Lite P&L = (lt_open  - lt_close)  × qty   ← short position on Lighter
-            if record.side == "sell" and record.matched_open_key:
-                open_rec = self.records.get(record.matched_open_key)
-                if (open_rec and open_rec.var_fill_price and open_rec.lighter_fill_price
-                        and record.var_fill_price and fill_price):
-                    qty = min(open_rec.qty, record.qty)
-                    record.var_pnl = (record.var_fill_price - open_rec.var_fill_price) * qty
-                    record.lt_pnl  = (open_rec.lighter_fill_price - fill_price) * qty
-                    record.roundtrip_pnl = record.var_pnl + record.lt_pnl
+            # Also retried from process_variational_trade_event in case that leg arrives
+            # second — see _try_finalize_roundtrip_pnl for why both call sites are needed.
+            self._try_finalize_roundtrip_pnl(record)
 
             payload = record.to_payload()
 
@@ -675,6 +690,64 @@ class VariationalToLighterRuntime:
                 record.lighter_side, fill_price, record.qty,
             )
         await self.append_order_log("lighter_fill", payload)
+
+    async def _backfill_missing_lighter_fills(self) -> None:
+        # account_orders 这个 WS 频道跟 order_book 不一样——order_book 有 offset 序列号，
+        # 一旦检测到跳变（lighter_order_book_sequence_gap）就会重新拉整份快照补齐；
+        # account_orders 完全没有等价机制，断线重连期间发生的成交推送会直接丢失，
+        # Lighter 服务端不会重放。08-16 08:07 那次"Lighter websocket reconnect after
+        # error"就丢了一笔对冲成交确认，record.lighter_fill_price 永久留空、pnl 也
+        # 算不出来（trade_records.csv 那一行 lighter_filled_price 是空的，但仓位本身
+        # 是对的——lighter_sync_loop 定期轮询的是仓位总量，不受这个影响）。
+        # 每次重连成功后，主动查一遍最近的已完成订单，把还缺 lighter_fill_price 的
+        # 挂起记录补上。
+        async with self._record_lock:
+            pending_ids = [
+                cid for cid, key in self.lighter_client_order_to_trade_key.items()
+                if (rec := self.records.get(key)) is not None and rec.lighter_fill_price is None
+            ]
+        if not pending_ids:
+            return
+
+        try:
+            async with self._lighter_signer_lock:
+                if not self.lighter_client:
+                    self.initialize_lighter_client()
+                auth_token, err = self.lighter_client.create_auth_token_with_expiry(
+                    api_key_index=self.api_key_index
+                )
+            if err is not None:
+                self.logger.warning("Lighter fill backfill: 获取 auth token 失败: %s", err)
+                return
+            from lighter import ApiClient, Configuration, OrderApi
+            api_client = ApiClient(configuration=Configuration(host=self.lighter_base_url))
+            try:
+                order_api = OrderApi(api_client)
+                resp = await order_api.account_inactive_orders(
+                    account_index=self.account_index,
+                    limit=50,
+                    authorization=None,
+                    auth=auth_token,
+                    market_id=self.lighter_market_index,
+                )
+            finally:
+                await api_client.close()
+        except Exception as exc:
+            self.logger.warning("Lighter fill backfill: 查询最近订单失败: %s", exc)
+            return
+
+        for order in resp.orders or []:
+            try:
+                cid = int(order.client_order_id)
+            except (TypeError, ValueError):
+                continue
+            if cid not in pending_ids:
+                continue
+            self.logger.warning(
+                "Lighter fill backfill: 补齐重连期间丢失的成交确认 client_order_id=%s status=%s",
+                cid, order.status,
+            )
+            await self.handle_lighter_fill_update(order.model_dump())
 
     def build_lighter_ws_url(self) -> str:
         if env_flag("LIGHTER_WS_SERVER_PINGS"):
@@ -715,6 +788,10 @@ class VariationalToLighterRuntime:
                             self.logger.warning("Failed to create Lighter WS auth token: %s", err)
                     except Exception as exc:
                         self.logger.warning("Error creating Lighter WS auth token: %s", exc)
+
+                    # 每次(重新)连接成功后补一次可能在上次断线期间丢失的成交确认，
+                    # 见 _backfill_missing_lighter_fills 顶部注释。
+                    await self._backfill_missing_lighter_fills()
 
                     while not self.stop_flag:
                         raw = await ws.recv()
@@ -1188,6 +1265,14 @@ class VariationalToLighterRuntime:
                                     if open_rec and open_rec.var_fill_price and pending_rec.var_fill_price:
                                         pending_rec.matched_open_key = open_key
                                         open_rec.matched_open_key = ph_key
+                                        # 这是"预对冲"快速路径——signal_loop 在下单成功时就立刻
+                                        # 对冲，Variational /events 的成交确认是之后才补上来的，
+                                        # 而这条恰恰是绝大多数真实交易走的路径（见架构说明：hedge
+                                        # immediately on order success）。之前只在另外两条路径加了
+                                        # _try_finalize_roundtrip_pnl 重试调用，漏了这条最常走的
+                                        # 路径，导致 Lighter 那腿先到时这里永远算不出 pnl
+                                        # （07-15 ETH 21:00/21:20 两笔平仓实测都是空的）。
+                                        self._try_finalize_roundtrip_pnl(pending_rec)
                             filled_payload = pending_rec.to_payload()
                     if pending_rec is not None:
                         # var_fill_price updated in-memory; signal_loop already logged variational_fill.
@@ -1274,15 +1359,12 @@ class VariationalToLighterRuntime:
                     open_key = self._open_trade_queue.popleft()
                     open_rec = self.records.get(open_key)
                     if open_rec and open_rec.var_fill_price and record.var_fill_price:
-                        # open leg: lighter_fill - var_fill (positive = captured spread)
-                        # close leg: var_fill - lighter_fill (negative if Lighter still higher)
-                        # round-trip per BTC = open_diff + close_diff
-                        open_diff = (open_rec.lighter_fill_price - open_rec.var_fill_price
-                                     if open_rec.lighter_fill_price else Decimal("0"))
-                        close_var_price = record.var_fill_price
-                        # Lighter close price not yet set; will update when lighter fill arrives
                         record.matched_open_key = open_key
                         open_rec.matched_open_key = key  # back-reference
+                        # In case the Lighter leg's fill callback already landed first (a real
+                        # race between two independent async paths — see
+                        # _try_finalize_roundtrip_pnl), retry the P&L computation here too.
+                        self._try_finalize_roundtrip_pnl(record)
                 filled_payload = record.to_payload()
             else:
                 filled_payload = None
@@ -1565,6 +1647,11 @@ class VariationalToLighterRuntime:
             portfolio_age = trading_state.get("portfolio_age")
             heartbeat_age = trading_state.get("heartbeat_age")
             _PORTFOLIO_STALE_SECONDS = 300
+            # 本地估算值只在 portfolio 短暂断连时够用——真实发生过一次断连卡了6小时+期间
+            # 用户还手动去交易所场外平仓的事故，本地估算完全不知道场外操作，auto-correct
+            # 反而凭着几小时前的旧快照在 Lighter 上开出一笔全新的、没有对应仓位的敞口。
+            # 超过这个硬上限就不再信任本地估算去下单纠正，只报警等人工核实。
+            _VAR_ESTIMATE_HARD_STALE_SECONDS = 1800
             if heartbeat_age is not None and heartbeat_age > 11:
                 _now_mono = time.monotonic()
                 if _now_mono - getattr(self, "_hb_stale_log_ts", 0) >= 600:
@@ -1622,13 +1709,25 @@ class VariationalToLighterRuntime:
                     abs(abs(var_qty) - abs(lighter_qty)) / abs(var_qty) * 100
                 )
 
+            estimate_untrustworthy = (
+                portfolio_age is not None and portfolio_age > _VAR_ESTIMATE_HARD_STALE_SECONDS
+            )
             if single_leg:
                 self._single_leg_blocked = True
                 self.logger.warning(
                     "SINGLE-LEG DETECTED: var_qty=%s lighter_qty=%s — new opens blocked, auto-correcting",
                     var_qty, lighter_qty,
                 )
-                await self._auto_correct_single_leg(var_qty, lighter_qty, standard_qty)
+                if estimate_untrustworthy:
+                    self.logger.error(
+                        "SINGLE-LEG auto-correct SKIPPED: portfolio stale for %.0fs (> %.0fs hard limit) "
+                        "— local var_position_estimate no longer trustworthy (may be outdated by manual "
+                        "off-system action); opens stay blocked but no corrective order placed, verify "
+                        "actual positions on both exchanges manually",
+                        portfolio_age, _VAR_ESTIMATE_HARD_STALE_SECONDS,
+                    )
+                else:
+                    await self._auto_correct_single_leg(var_qty, lighter_qty, standard_qty)
             elif imbalance_pct is not None and imbalance_pct > _IMBALANCE_WARN_PCT:
                 self._single_leg_blocked = True
                 self.logger.warning(
@@ -1636,7 +1735,16 @@ class VariationalToLighterRuntime:
                     "— new opens blocked, auto-correcting",
                     var_qty, lighter_qty, imbalance_pct, _IMBALANCE_WARN_PCT,
                 )
-                await self._auto_correct_single_leg(var_qty, lighter_qty, standard_qty)
+                if estimate_untrustworthy:
+                    self.logger.error(
+                        "IMBALANCE auto-correct SKIPPED: portfolio stale for %.0fs (> %.0fs hard limit) "
+                        "— local var_position_estimate no longer trustworthy (may be outdated by manual "
+                        "off-system action); opens stay blocked but no corrective order placed, verify "
+                        "actual positions on both exchanges manually",
+                        portfolio_age, _VAR_ESTIMATE_HARD_STALE_SECONDS,
+                    )
+                else:
+                    await self._auto_correct_single_leg(var_qty, lighter_qty, standard_qty)
             else:
                 if self._single_leg_blocked:
                     reason = (
@@ -2196,6 +2304,11 @@ class VariationalToLighterRuntime:
                                 if open_rec:
                                     pending_rec.matched_open_key = open_key
                                     open_rec.matched_open_key = pending_key
+                                    # 这里是最早知道 var_fill_price 的地方（accept_response
+                                    # 或已缓冲的 /events 事件），如果 Lighter 那腿的对冲成交
+                                    # 确认恰好更快、已经先到，这里就能补上 pnl，不用等后面
+                                    # 任何一条路径——第四处需要重试调用的地方。
+                                    self._try_finalize_roundtrip_pnl(pending_rec)
                     # Pre-hedged token — for the case where the fill event arrives AFTER
                     # we release _order_in_flight (below); fast-path in
                     # process_variational_trade_event will merge fill price into pending_rec.

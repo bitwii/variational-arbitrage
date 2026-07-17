@@ -12,6 +12,8 @@ dist/
 .venv/
 venv/
 env/
+env3.11/
+env311/
 
 # Test and coverage artifacts
 .pytest_cache/

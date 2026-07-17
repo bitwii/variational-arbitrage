@@ -9,6 +9,14 @@ const AUTO_RELOAD_COOLDOWN_MS = 5000;
 const KEEPALIVE_ALARM = "cdpForwarderKeepAlive";
 const KEEPALIVE_PERIOD_MINUTES = 0.4; // ~24s，小于30秒的回收阈值
 
+// 遇到过一次真实事故：页面自己的 /events、/portfolio WebSocket 断开后，Variational
+// 前端自身的重连逻辑没有触发（这跟 debugger detach 是两码事，全程没有 onDetach 事件，
+// 插件本身一直认为自己是连接状态），导致 heartbeat 假死超过 9 小时，只能靠人工手动刷新
+// 页面才恢复。下面这套机制用现有的 keepalive alarm 顺带检测页面级 WS 是否长时间没有新
+// 帧，超过阈值就自动刷新标签页，不用等人发现。
+const PAGE_WS_STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5分钟没有任何新帧，判定为页面级WS假死
+const STALE_RELOAD_COOLDOWN_MS = 3 * 60 * 1000; // 触发一次自动刷新后至少间隔3分钟，给页面留出重连时间，避免反复刷新
+
 const DEFAULT_CONFIG = {
   wsEndpoint: "ws://127.0.0.1:8766",
   restEndpoint: "ws://127.0.0.1:8767",
@@ -140,6 +148,9 @@ const state = {
   lastError: null,
   lastAutoReloadAt: 0,
   hookScriptId: null,
+  streamHeartbeat: new Map(), // matchedPattern -> 最近一次收到帧/建立连接的时间戳(ms)
+  lastStaleReloadAt: 0,
+  staleReloadStreak: new Map(), // matchedPattern -> 连续触发刷新但还没恢复过的次数
 };
 
 class ForwardSocket {
@@ -662,6 +673,9 @@ function cleanupForwardingState() {
   state.attachedTabId = null;
   state.lastAutoReloadAt = 0;
   state.hookScriptId = null;
+  state.streamHeartbeat.clear();
+  state.lastStaleReloadAt = 0;
+  state.staleReloadStreak.clear();
   stopKeepAliveAlarm();
   persistActiveState();
   wsForwarder.close();
@@ -679,6 +693,49 @@ async function persistActiveState() {
     });
   } catch {
     // storage 写失败不影响当前会话，下次唤醒重新走一遍 startForwarding 即可。
+  }
+}
+
+function checkPageWebSocketHealth() {
+  if (!state.active || state.attachedTabId == null) {
+    return;
+  }
+  const now = Date.now();
+  if (now - state.lastStaleReloadAt < STALE_RELOAD_COOLDOWN_MS) {
+    return;
+  }
+  for (const [pattern, lastSeenAt] of state.streamHeartbeat) {
+    const staleMs = now - lastSeenAt;
+    if (staleMs <= PAGE_WS_STALE_THRESHOLD_MS) {
+      continue;
+    }
+    state.lastStaleReloadAt = now;
+    state.staleReloadStreak.set(pattern, (state.staleReloadStreak.get(pattern) || 0) + 1);
+    const streak = state.staleReloadStreak.get(pattern);
+    // 发给 Python 侧落盘，否则这类事件只会体现为 runtime.log 里 portfolio/heartbeat
+    // stale 告警持续增长，没有明确的"已自动触发刷新"记录，事后没法确认是自愈了还是
+    // 又要等人工介入。streak 是连续第几次对同一个 pattern 触发刷新（中间没有真正恢复
+    // 过），用于判断"这次刷新到底有没有生效"。
+    wsForwarder.send({
+      kind: "page_ws_stale_reload",
+      pattern,
+      staleMs,
+      streak,
+      timestamp: nowIso()
+    });
+    // 之前这里会 clear() 整个 Map——如果这次 reload 没能让页面真正重连上（浏览器侧原因，
+    // 这边看不到也控制不了），Map 就会一直空着，导致 checkPageWebSocketHealth 的 for 循环
+    // 永远没有东西可遍历，等于自愈机制只能成功一次，失败一次就永久失效。真实发生过一次
+    // 刷新没生效、卡死 6 小时的事故。现在不清空，保留旧时间戳：如果这次没恢复，冷却时间一过
+    // 下次检查依然会发现"还是超过阈值没收到帧"，自动再刷新一次，变成持续重试直到真正恢复。
+    chrome.tabs.reload(state.attachedTabId, {}, () => {
+      const err = chrome.runtime.lastError;
+      if (err) {
+        state.lastError = `Auto reload failed (page ws stale): ${err.message}`;
+        notifyStatus();
+      }
+    });
+    return; // 一个心跳周期只处理一次，避免同时对多个 stale pattern 反复触发刷新
   }
 }
 
@@ -702,6 +759,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   wsForwarder.connect();
   restForwarder.connect();
   commandSocket.connect();
+  checkPageWebSocketHealth();
 });
 
 // service worker 每次被（重新）实例化时都会执行一遍模块顶层代码，包括被 Chrome 回收后
@@ -818,6 +876,10 @@ function forwardWebSocketFrame(direction, params) {
   if (!meta) {
     return;
   }
+  state.streamHeartbeat.set(meta.matchedPattern, Date.now());
+  // 收到真实帧才算这条流真的恢复了（webSocketCreated 只说明页面发起了连接尝试，
+  // 不代表连上之后还能正常收发），重置连续失败计数。
+  state.staleReloadStreak.delete(meta.matchedPattern);
 
   wsForwarder.send({
     kind: "ws_frame",
@@ -860,6 +922,7 @@ async function handleDebuggerEvent(source, method, params) {
         matchedPattern,
         createdAt: nowIso()
       });
+      state.streamHeartbeat.set(matchedPattern, Date.now());
       // 之前这里只在本地记了一下，从来没告诉过 Python 侧"页面又建了一条新连接"——
       // 断连之后要判断"页面到底有没有尝试重连"，全靠这条信号，之前完全看不到。
       wsForwarder.send({
